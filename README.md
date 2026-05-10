@@ -76,7 +76,7 @@ Add to `platformio.ini`:
 
 ```ini
 lib_deps =
-    https://github.com/xanderwasserman/simpleota-arduino.git
+    https://github.com/xanderwasserman/SimpleOTAClient-Arduino.git
 ```
 
 ---
