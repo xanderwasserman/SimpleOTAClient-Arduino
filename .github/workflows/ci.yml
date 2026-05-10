@@ -1,0 +1,37 @@
+# Compiles all examples against Arduino-ESP32 on every push and PR to main.
+# Catches build regressions before they reach a release tag.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  compile:
+    name: Compile examples (ESP32)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile sketches
+        uses: arduino/compile-sketches@v1
+        with:
+          fqbn: esp32:esp32:esp32
+          platforms: |
+            - name: esp32:esp32
+              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          libraries: |
+            - source-path: ./
+          enable-deltas-report: true
+          sketches-report-path: sketches-reports
+
+      - name: Upload sketches report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sketches-reports
+          path: sketches-reports

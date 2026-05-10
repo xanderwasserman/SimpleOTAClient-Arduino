@@ -1,0 +1,64 @@
+# Automatic release workflow.
+#
+# Trigger: after the CI workflow completes successfully on main.
+# Skips entirely if CI failed; broken builds are never tagged.
+#
+# What it does:
+#   1. Reads the version from library.properties.
+#   2. Skips if a tag for that version already exists (idempotent;
+#      safe to re-run on non-version-bump pushes).
+#   3. Creates a `vX.Y.Z` tag and a GitHub Release.
+#   4. Generates release notes automatically from the commit messages /
+#      merged PRs since the previous tag (GitHub's built-in generator).
+#
+# To cut a release: bump `version=` in library.properties, commit, push.
+# CI runs first; if it passes, this workflow tags and releases automatically.
+#
+# The firmware binary is NOT attached here; the Arduino Library Manager
+# sources the library from the source tag, not from a binary asset.
+
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]          # only runs after CI completes
+    types: [completed]
+    branches: [main]
+
+jobs:
+  release:
+    name: Tag and release
+    runs-on: ubuntu-latest
+    # Only proceed if CI passed; don't tag a broken build.
+    if: github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write   # needed to create tags and releases
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for release-notes generation
+
+      - name: Read version from library.properties
+        id: lib
+        run: |
+          VERSION=$(grep '^version=' library.properties | cut -d= -f2 | tr -d '[:space:]')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+
+      - name: Check whether tag already exists
+        id: tag_check
+        run: |
+          if git rev-parse "${{ steps.lib.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.tag_check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.lib.outputs.tag }}
+          name: ${{ steps.lib.outputs.tag }}
+          generate_release_notes: true   # auto-generates notes from commits/PRs

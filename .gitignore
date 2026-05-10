@@ -1,0 +1,21 @@
+# Arduino / ESP32 build output
+**/build/
+**/.pio/
+
+# Compiled artifacts (should never be committed; upload .bin to a release)
+*.bin
+*.elf
+*.map
+*.hex
+*.merged.bin
+*.partitions.bin
+*.bootloader.bin
+
+# Arduino IDE working files
+*.bak
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
