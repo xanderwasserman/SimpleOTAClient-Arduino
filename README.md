@@ -23,6 +23,7 @@ Integrates your ESP32 project with SimpleOTA in a few lines: check for an update
 - [API reference](#api-reference)
 - [OTA lifecycle](#ota-lifecycle)
 - [Security](#security)
+- [Rollback](#rollback)
 - [Configuration](#configuration)
 - [Logging](#logging)
 - [Partition table](#partition-table)
@@ -38,6 +39,7 @@ Integrates your ESP32 project with SimpleOTA in a few lines: check for an update
 - **Streaming download with on-the-fly SHA-256:** firmware is verified before the partition is committed; no second pass, no large RAM buffer.
 - **NVS build-number persistence:** the library reads and writes the SimpleOTA-assigned build number automatically.
 - **Status event reporting:** reports the full update lifecycle back to the SimpleOTA backend.
+- **Trial install with timeout-based rollback:** the library snapshots the previous image before applying, then rolls back to it if `confirmRunning()` is not called within the configurable timeout. See [Rollback](#rollback).
 - **No third-party dependencies:** uses only libraries bundled with Arduino-ESP32 core (`HTTPClient`, `Update`, `NetworkClientSecure` / `WiFiClientSecure`, `Preferences`, `mbedtls`).
 - **Compatible with Arduino-ESP32 2.x and 3.x**.
 - **Secure by default:** the bundled ISRG Root X1 root CA is used automatically; no configuration needed for production.
@@ -149,7 +151,7 @@ Three runnable examples are bundled:
 | --- | --- |
 | [`examples/BasicOTA/BasicOTA.ino`](examples/BasicOTA/BasicOTA.ino) | Minimal polling integration: Wi-Fi up, `check()` + `apply()` from `loop()`. Start here. |
 | [`examples/ManagedOTA/ManagedOTA.ino`](examples/ManagedOTA/ManagedOTA.ino) | Hands-off managed mode using `begin()` with an `isConnected` probe and a result callback. |
-| [`examples/AdvancedOTA/AdvancedOTA.ino`](examples/AdvancedOTA/AdvancedOTA.ino) | Custom `deviceId` / `boardId` / `hardwareRevision`, `setAutoReboot(false)`, manual `report("rebooted")`, verbose logging. |
+| [`examples/AdvancedOTA/AdvancedOTA.ino`](examples/AdvancedOTA/AdvancedOTA.ino) | Custom `deviceId` / `boardId` / `hardwareRevision`, `setAutoReboot(false)` with `rebootForUpdate()` for the application-driven restart, verbose logging. |
 
 ---
 
@@ -218,7 +220,7 @@ Executes the offer stored by the most recent successful `check()`.
 | `OTA_FLASH_FAIL` | Network or flash write error. Partition was not committed. |
 | `OTA_NO_OFFER` | `check()` had not been called or returned `false`. |
 
-> **Note on `validated`:** this event is reported after `Update.end()` succeeds (meaning "the image was flashed cleanly"), not after a successful boot. Arduino mode has no first-boot validation mechanism; see [Limitations](#limitations).
+> **Note on `validated`:** this event is reported after `Update.end()` succeeds (meaning "the image was flashed cleanly"), not after a successful boot. A subsequent `reboot` event is emitted immediately before `esp_restart()` on the auto-reboot path; a `confirmed` event is emitted on the first 2xx `/check/` after a successful trial confirmation (see [Rollback](#rollback)).
 
 ---
 
@@ -226,15 +228,15 @@ Executes the offer stored by the most recent successful `check()`.
 
 Manually posts a single status event to `/api/v1/ota/status/`. Useful for custom lifecycle control flows. Returns `true` on HTTP 2xx with `"accepted": true`.
 
-Requires a deployment context populated by a successful `check()`. The context is retained through `apply()` (so a post-apply `report("rebooted")` works) and is cleared on the next `check()` invocation. Outside that window, `report()` returns `false` without sending anything.
+Requires a deployment context populated by a successful `check()`. The context is retained through `apply()` (so post-apply `report()` calls work) and is cleared on the next `check()` invocation. Outside that window, `report()` returns `false` without sending anything.
 
 Full event vocabulary defined by the API:
 
 ```
-offered  download_started  downloaded  flashed  rebooted  validated  failed  rolled_back
+offered  download_started  downloaded  flashed  validated  reboot  confirmed  failed  rolled_back
 ```
 
-Events emitted automatically by `apply()`: `download_started`, `downloaded`, `flashed`, `validated`, `failed`.
+Events emitted automatically by `apply()`: `download_started`, `downloaded`, `flashed`, `validated`, `failed`, and (on the auto-reboot path) `reboot`. The `confirmed` event is emitted by the library on the first 2xx `/check/` after a successful trial confirmation (see [Rollback](#rollback)); `rolled_back` is emitted on the first 2xx `/check/` after a trial-timeout rollback.
 
 ---
 
@@ -246,7 +248,20 @@ Overrides the CA certificate used for HTTPS verification. By default the library
 
 ### `void setAutoReboot(bool enabled)`
 
-Default: `true`. When `false`, `apply()` returns `OTA_SUCCESS` without calling `esp_restart()`, giving the application control over when the reboot happens. The NVS build number write and `validated` event still occur before the function returns.
+Default: `true`. When `false`, `apply()` returns `OTA_SUCCESS` without calling `esp_restart()`, giving the application control over when the reboot happens. The NVS build number write and `validated` event still occur before the function returns. The library does **not** emit a `reboot` event in this mode; use [`rebootForUpdate()`](#void-rebootforupdate) when the application is ready to restart so the server sees the same event sequence as the auto-reboot path.
+
+---
+
+### `void rebootForUpdate()`
+
+Convenience for applications running with `setAutoReboot(false)`. Emits the `reboot` lifecycle event for the just-applied deployment, then calls `esp_restart()`. Does not return. Equivalent to:
+
+```cpp
+ota.report("reboot");
+ESP.restart();
+```
+
+Must be called in the post-apply window (between a successful `apply()` and the next `check()`); outside that window the status POST is silently skipped and the device still reboots.
 
 ---
 
@@ -312,14 +327,47 @@ Enables or disables verbose `[SimpleOTAClient]` logging on `Serial` at runtime. 
 
 ---
 
+### `void setRollbackEnabled(bool enabled)`
+
+Enables or disables the library-managed trial-install / rollback machinery. Default: `true`. See [Rollback](#rollback). When `false`, `apply()` skips the pre-OTA snapshot and `confirmRunning()` always returns `false` (no trial is ever armed). The `confirmed` event is still emitted on the first 2xx `/check/` after a reboot, via the NVS-backed deferred path.
+
+---
+
+### `void setManagedAutoConfirm(bool enabled)`
+
+In managed mode (`begin()`), controls whether the library automatically calls `confirmRunning()` on the first 2xx response from `/api/v1/ota/check/` after a trial boot. Default: `true`. Set to `false` to require an explicit `confirmRunning()` call from your application code instead. No effect in polling mode (where you always call `confirmRunning()` yourself).
+
+---
+
+### `void setConfirmTimeout(uint32_t seconds)`
+
+Sets the per-instance trial-install confirm timeout in seconds. Defaults to `SIMPLEOTA_CONFIRM_TIMEOUT_S` (compile-time default `300`). Clamped to `[10, 86400]`. Effective starting with the next `apply()`. See [Rollback](#rollback).
+
+---
+
+### `bool confirmRunning()`
+
+Confirms that the currently-running firmware is healthy and seals the trial install. Cancels the rollback timer, clears the trial snapshot (`prev_*` keys and trial flag) from NVS, and queues a `confirmed` status event for the next successful `/check/` round-trip. Returns `true` if a trial was in progress and is now confirmed; `false` if no trial was in progress (a normal boot — this is a safe no-op).
+
+Call from your application code once you are satisfied the new firmware is working. In polling mode this is required after every successful OTA; in managed mode it is only required if you have called `setManagedAutoConfirm(false)`.
+
+---
+
+### `bool isTrialInstall()`
+
+Returns `true` while a trial install is in progress (i.e. the current boot is the first boot of a new firmware image and `confirmRunning()` has not yet been called). Use this to avoid expensive health-probe code on normal boots.
+
+---
+
 ### `void begin(...)`
 
 Starts a FreeRTOS background task (stack: 8 KB, priority: 1) that runs the following loop:
 
 1. If `isConnected` was supplied, wait until it returns `true` (polled every second). Otherwise skip this step.
-2. Call `check()`. If an update is available, call `apply()`.
-3. If `onResult` is set and `apply()` returned without rebooting, invoke it with the `OTAResult`.
-4. Sleep for `checkIntervalSec` seconds, then repeat.
+2. **If a trial install is in progress**, run a short-retry inner loop: retry `/check/` every `SIMPLEOTA_TRIAL_RETRY_INTERVAL_S` seconds (default 10 s) until the server responds with 2xx or the confirm timeout expires. With `setManagedAutoConfirm(true)` (default), call `confirmRunning()` on the first 2xx and continue; the `confirmed` event fires on that same `/check/` response. Skip this step on a normal (non-trial) boot.
+3. Call `check()`. If an update is available, call `apply()`.
+4. If `onResult` is set and `apply()` returned without rebooting, invoke it with the `OTAResult`.
+5. Sleep for `checkIntervalSec` seconds, then repeat.
 
 The library is transport-agnostic and does not import any networking stack. The application is responsible for bringing up Wi-Fi, Ethernet, PPP, or whatever connectivity it uses. The `isConnected` callback is purely an optimisation; without it, transport failures simply return `false` from `check()` and are retried on the next interval.
 
@@ -346,8 +394,10 @@ Bundled root CA PEM (ISRG Root X1 / Let's Encrypt), used by default for all HTTP
 The sequence of events reported to the server during a successful `apply()`:
 
 ```
-check()  →  download_started  →  downloaded  →  flashed  →  validated  →  [esp_restart()]
+check()  →  download_started  →  downloaded  →  flashed  →  validated  →  reboot  →  [esp_restart()]  →  confirmed
 ```
+
+The terminal `confirmed` event fires on the first 2xx `/check/` after the new image boots successfully and `confirmRunning()` runs (managed mode does this automatically by default; polling mode requires an explicit call). If the trial times out instead, the library rolls back and a `rolled_back` event takes the place of `confirmed`.
 
 On failure at any stage, a `failed` event is reported with a short reason token before the method returns:
 
@@ -363,6 +413,8 @@ On failure at any stage, a `failed` event is reported with a short reason token 
 | `short_read` | Stream closed before `Content-Length` bytes arrived |
 | `checksum_mismatch` | SHA-256 of received bytes did not match server's value |
 | `update_end_failed` | `Update.end()` failed after streaming completed |
+
+If [rollback](#rollback) is enabled and a trial install is not confirmed within the timeout, the library reboots into the previous partition and — once the next `check()` succeeds — sends a separate `rolled_back` event with reason `confirm_timeout`.
 
 ---
 
@@ -394,6 +446,68 @@ This mode exists only to simplify local development. **Do not use it in producti
 
 ---
 
+## Rollback
+
+Since v0.2.0 the library supports a **library-managed trial install with timeout-based rollback**. When `apply()` succeeds, the library snapshots the outgoing image's partition address and NVS metadata, then reboots into the new firmware. The new boot enters a "trial" state: if the application calls `confirmRunning()` before `SIMPLEOTA_CONFIRM_TIMEOUT_S` (default 300 s), the trial is sealed and the snapshot is discarded. Otherwise the library restores the previous partition and reboots back into it.
+
+Stock Arduino-ESP32 builds do not have the IDF bootloader's pending-verify feature enabled, so this is implemented entirely in firmware rather than via `esp_ota_mark_app_valid_cancel_rollback()`. A consequence: a hard hang **before** the library's confirm-machinery runs (e.g. inside a global object constructor, or in `setup()` before `confirmRunning()` is reached) is still caught by the timeout, but a hang in the C runtime or bootloader is not. See [Limitations](#limitations).
+
+### Polling mode
+
+You must call `confirmRunning()` explicitly. The natural place is at the top of `loop()`, *after* your application has proven it can do real work:
+
+```cpp
+void loop() {
+    if (WiFi.status() != WL_CONNECTED) connectWiFi();
+    ota.confirmRunning();   // no-op when not in trial; safe to call every iteration
+    // ... your app code ...
+    if (ota.check()) ota.apply();
+    delay(SIMPLEOTA_CHECK_INTERVAL_S * 1000UL);
+}
+```
+
+If you never call `confirmRunning()`, every successful OTA will roll back.
+
+### Managed mode (default)
+
+`begin()` runs the trial loop on its own. By default it auto-confirms the trial as soon as the OTA task gets its first 2xx response from `/api/v1/ota/check/`, which transitively proves boot, connectivity, TLS, token auth, and server reachability. No app code change is needed.
+
+To gate confirmation on your own application-level health check instead:
+
+```cpp
+ota.setManagedAutoConfirm(false);
+ota.setConfirmTimeout(120);   // give your app 120 s to confirm
+ota.begin(...);
+// ...
+if (ota.isTrialInstall() && applicationHealthy()) {
+    ota.confirmRunning();
+}
+```
+
+See `examples/RollbackOTA` for the full pattern.
+
+### Cellular and other high-latency transports
+
+The default 300 s timeout assumes Wi-Fi. For cellular or other transports where attaching, registering, and reaching the API can routinely take several minutes, raise `setConfirmTimeout()` accordingly. The clamp is `[10, 86400]` seconds.
+
+### Server interaction
+
+When the library rolls back, the previous boot's snapshot is restored to the partition and to NVS (build number, hash, version label). On the *next* boot, after `check()` makes its first successful round-trip, the library sends a `rolled_back` status event with the failed deployment's `deployment_id` and `build_number` and a reason of `confirm_timeout`. The event is retried on every subsequent `check()` until the server accepts it.
+
+On a successful trial (device boots new image, `confirmRunning()` executes), the library queues a `confirmed` status event. It is sent on the first 2xx from `/check/` after `confirmRunning()` has run and is retried on every subsequent `check()` until the server accepts it. Both `confirmed` and `rolled_back` are persisted in NVS so they survive a power-cycle between the confirm/rollback event and the next network round-trip.
+
+### Disabling rollback
+
+If you do not want the rollback machinery at all:
+
+```cpp
+ota.setRollbackEnabled(false);
+```
+
+This skips the snapshot in `apply()` and the trial-boot arming entirely. Any residual trial state left in NVS from a previous boot with rollback enabled is cleaned up automatically by `processBootValidation()` on the next boot — no manual NVS clearing is needed.
+
+---
+
 ## Configuration
 
 Override any of the following with a `-D` compiler flag or a `#define` placed **before** `#include <SimpleOTAClient.h>`:
@@ -402,6 +516,8 @@ Override any of the following with a `-D` compiler flag or a `#define` placed **
 | --- | --- | --- |
 | `SIMPLEOTA_TIMEOUT_MS` | `15000` | Milliseconds before an HTTP request or a stalled download is abandoned. |
 | `SIMPLEOTA_CHECK_INTERVAL_S` | `3600` | Default check interval (in seconds) used by `begin()`. Also exposed as a constant for manual scheduling in polling mode. |
+| `SIMPLEOTA_CONFIRM_TIMEOUT_S` | `300` | Default trial-install confirm timeout (in seconds). See [Rollback](#rollback). Overridable per-instance via `setConfirmTimeout()`. |
+| `SIMPLEOTA_TRIAL_RETRY_INTERVAL_S` | `10` | How often (in seconds) the managed task retries `/check/` while in a trial install. |
 | `SIMPLEOTA_DEBUG` | `0` | Compile-time default for verbose `[SimpleOTAClient]` logging on `Serial`. Prefer the runtime `SimpleOTAClient::setDebug(true)` toggle from your sketch; see [Logging](#logging). |
 
 **Retry policy:** `check()` and status posts retry once after a 2-second delay on transport failure (HTTP code ≤ 0). They never retry on any received HTTP response. The firmware download in `apply()` does not retry; a failure returns `OTA_FLASH_FAIL` and the next `check()` cycle can try again.
@@ -443,9 +559,9 @@ If `Update.begin()` fails at runtime, this is the most likely cause. Verify your
 
 | Limitation | Detail |
 | --- | --- |
-| No rollback / first-boot validation | `validated` means "flashed cleanly", not "booted successfully". There is no automatic rollback if the new image fails to boot. This is an inherent constraint of Arduino. |
-| No automatic `rebooted` event | The library transitions directly from `validated` to `esp_restart()`. Applications that disable auto-reboot can call `report("rebooted")` explicitly before restarting; see AdvancedOTA. |
-| `report()` requires a deployment context | The method needs a `deployment_id`, which only exists after a successful `check()`. The deployment context is retained through `apply()` so post-apply events (e.g. `"rebooted"`) work, but `report()` returns `false` before any `check()` has succeeded. |
+| Rollback gap before `confirmRunning()` is callable | The library-managed rollback (see [Rollback](#rollback)) requires the device to reach the point in `setup()` or `loop()` where `confirmRunning()` (polling) or the OTA task's first `/check/` (managed) runs. A crash before that point — e.g., in a constructor of a global object, or in `setup()` before connectivity comes up — is still caught by the timeout, but a hard hang in the bootloader or pre-`setup()` C runtime is not. Native ESP-IDF rollback (pending-verify) is not used because Arduino-ESP32 builds do not ship with bootloader rollback enabled. |
+| No automatic `reboot` event when `setAutoReboot(false)` | The library only emits `reboot` on the auto-reboot path it controls. Applications that drive their own restart should call `rebootForUpdate()` (which emits the event then calls `esp_restart()`) instead of `ESP.restart()` directly; see AdvancedOTA. |
+| `report()` requires a deployment context | The method needs a `deployment_id`, which only exists after a successful `check()`. The deployment context is retained through `apply()` so post-apply events (e.g. `"reboot"`) work, but `report()` returns `false` before any `check()` has succeeded. |
 | Application owns connectivity | The library is transport-agnostic and does not manage Wi-Fi, Ethernet, PPP, or reconnects. Establish a working IP connection before calling any library method, or supply an `isConnected` probe to `begin()`. |
 | TLS uses bundled root CA | The bundled ISRG Root X1 cert covers current SimpleOTA infrastructure. If the platform migrates storage providers to one using a different root, a library update will be required. |
 
