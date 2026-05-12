@@ -9,10 +9,9 @@
 //   - setNvsSchemaVersion(): incremented when your own NVS layout changes.
 //   - setLabels(): arbitrary key/value metadata for server-side targeting.
 //   - setSecurityMode(): advertises TLS capability to the server.
-//   - setAutoReboot(false): the application decides when to restart.
+//   - setAutoReboot(false): the application decides when to restart, and
+//     uses rebootForUpdate() to emit the "reboot" event before restarting.
 //   - lastOfferedVersion(): read the version label from the check() offer.
-//   - Manual report() calls to emit lifecycle events the library doesn't
-//     emit automatically (e.g. "rebooted" after first boot of a new image).
 //   - Verbose logging via SimpleOTAClient::setDebug(true).
 
 #include <WiFi.h>
@@ -57,6 +56,12 @@ void setup() {
     SimpleOTAClient::setDebug(true);   // verbose [SimpleOTAClient] logs on Serial
     connectWiFi();
 
+    // Confirm a prior trial install (no-op if not in trial). Call this as
+    // early as your application can prove it is healthy. Here we do it
+    // right after Wi-Fi succeeds; production firmware would gate it on
+    // an end-to-end health probe (e.g., MQTT round-trip).
+    ota.confirmRunning();
+
     // Tell the server which partition layout this device uses.
     // Match the scheme you selected under Tools -> Partition Scheme.
     ota.setPartitionProfile("default_4mb");
@@ -97,12 +102,12 @@ void setup() {
                 // Application-specific shutdown: flush logs, persist state,
                 // notify a parent device, etc. Then reboot when ready.
                 delay(2000);
-                // Optional: report a custom post-apply event. The deployment
-                // context is retained through apply() and until the next
-                // check(), so report() can correlate this event with the
-                // deployment that was just installed.
-                ota.report("rebooted");
-                ESP.restart();
+                // rebootForUpdate() emits the "reboot" lifecycle event for
+                // the just-applied deployment, then calls esp_restart(). Use
+                // this instead of a bare ESP.restart() when running with
+                // setAutoReboot(false) so the server sees the same event
+                // sequence it would on the auto-reboot path.
+                ota.rebootForUpdate();
                 break;
             case OTA_CHECKSUM_FAIL:
                 Serial.println("[app] checksum mismatch; safe to retry later");

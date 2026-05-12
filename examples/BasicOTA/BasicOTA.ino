@@ -58,6 +58,14 @@ void loop() {
         connectWiFi();
     }
 
+    // Rollback support: if the previous OTA armed a trial install, this call
+    // confirms the new image is healthy. Place it where you are confident the
+    // application is working (after sensors initialized, first message
+    // exchanged with your service, etc.). Polling-mode users MUST call this
+    // explicitly or every OTA will roll back after SIMPLEOTA_CONFIRM_TIMEOUT_S
+    // (default 300s). It is a no-op when no trial is in progress.
+    ota.confirmRunning();
+
     if (ota.check()) {
         OTAResult r = ota.apply();   // reboots on success by default
         if (r != OTA_SUCCESS) {
