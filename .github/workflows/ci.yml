@@ -1,5 +1,5 @@
-# Compiles all examples against Arduino-ESP32 on every push and PR to main.
-# Catches build regressions before they reach a release tag.
+# Lints the library with arduino-lint and compiles all examples against
+# Arduino-ESP32 on every push and PR to main.
 
 name: CI
 
@@ -10,6 +10,19 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    name: Arduino lint (strict, library-manager update)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/arduino-lint-action@v2
+        with:
+          project-type: library
+          library-manager: update
+          compliance: strict
+
   compile:
     name: Compile examples (ESP32)
     runs-on: ubuntu-latest
