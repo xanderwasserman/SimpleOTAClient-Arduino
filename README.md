@@ -363,11 +363,12 @@ Returns `true` while a trial install is in progress (i.e. the current boot is th
 
 Starts a FreeRTOS background task (stack: 8 KB, priority: 1) that runs the following loop:
 
-1. If `isConnected` was supplied, wait until it returns `true` (polled every second). Otherwise skip this step.
-2. **If a trial install is in progress**, run a short-retry inner loop: retry `/check/` every `SIMPLEOTA_TRIAL_RETRY_INTERVAL_S` seconds (default 10 s) until the server responds with 2xx or the confirm timeout expires. With `setManagedAutoConfirm(true)` (default), call `confirmRunning()` on the first 2xx and continue; the `confirmed` event fires on that same `/check/` response. Skip this step on a normal (non-trial) boot.
-3. Call `check()`. If an update is available, call `apply()`.
-4. If `onResult` is set and `apply()` returned without rebooting, invoke it with the `OTAResult`.
-5. Sleep for `checkIntervalSec` seconds, then repeat.
+1. **If `initialDelayMs` > 0**, sleep for that many milliseconds (one-shot, at task start only). Use this to stagger the first HTTPS request relative to other TLS sessions starting concurrently at boot (e.g. MQTT). Default: `0`.
+2. If `isConnected` was supplied, wait until it returns `true` (polled every second). Otherwise skip this step.
+3. **If a trial install is in progress**, run a short-retry inner loop: retry `/check/` every `SIMPLEOTA_TRIAL_RETRY_INTERVAL_S` seconds (default 10 s) until the server responds with 2xx or the confirm timeout expires. With `setManagedAutoConfirm(true)` (default), call `confirmRunning()` on the first 2xx and continue; the `confirmed` event fires on that same `/check/` response. Skip this step on a normal (non-trial) boot.
+4. Call `check()`. If an update is available, call `apply()`.
+5. If `onResult` is set and `apply()` returned without rebooting, invoke it with the `OTAResult`.
+6. Sleep for `checkIntervalSec` seconds, then repeat.
 
 The library is transport-agnostic and does not import any networking stack. The application is responsible for bringing up Wi-Fi, Ethernet, PPP, or whatever connectivity it uses. The `isConnected` callback is purely an optimisation; without it, transport failures simply return `false` from `check()` and are retried on the next interval.
 

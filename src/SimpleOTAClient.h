@@ -382,10 +382,15 @@ public:
      *                          only attempts a check when it returns true. If nullptr
      *                          (default), the task always attempts a check; transport
      *                          failures are absorbed by the normal retry paths.
+     * @param initialDelayMs    Milliseconds to wait inside the task before the first
+     *                          check(). Use this to avoid lwIP contention when other
+     *                          TLS sessions (e.g. MQTT) are starting concurrently at
+     *                          boot. Default: 0 (no delay).
      */
     void begin(uint32_t checkIntervalSec = SIMPLEOTA_CHECK_INTERVAL_S,
                void (*onResult)(OTAResult) = nullptr,
-               bool (*isConnected)()       = nullptr);
+               bool (*isConnected)()       = nullptr,
+               uint32_t initialDelayMs     = 0);
 
     /**
      * @brief Stop the managed-mode background task started by begin().
@@ -491,12 +496,13 @@ private:
     void processBootValidation();
     void snapshotPreOtaState();        ///< Called from apply() before esp_restart().
     void performRollback();            ///< Timer callback target and explicit caller.
-    void clearTrialState();            ///< Wipe all sota_prev_* / sota_fail_* / sota_trial / sota_conf_pend keys.
+    void clearTrialState();            ///< Wipe trial snapshot keys only (sota_trial, sota_prev_*). Does NOT touch sota_fail_* or sota_conf_pend.
     void reportRolledBackIfPending();  ///< Attempt the deferred rolled_back POST.
     void reportConfirmedIfPending();   ///< Attempt the deferred confirmed POST.
 
     // Managed-mode state.
     uint32_t     _checkIntervalSec;
+    uint32_t     _initialDelayMs;
     void       (*_onResult)(OTAResult);
     bool       (*_isConnected)();
     TaskHandle_t _taskHandle;

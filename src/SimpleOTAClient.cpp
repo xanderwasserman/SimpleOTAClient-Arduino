@@ -334,6 +334,7 @@ SimpleOTAClient::SimpleOTAClient(const char* token,
       _insecureWarned(false),
       _authWarned(false),
       _checkIntervalSec(0),
+      _initialDelayMs(0),
       _onResult(nullptr),
       _isConnected(nullptr),
       _taskHandle(nullptr) {
@@ -375,9 +376,11 @@ const char* SimpleOTAClient::lastOfferedVersion() const       { return _offeredV
 
 void SimpleOTAClient::begin(uint32_t checkIntervalSec,
                       void (*onResult)(OTAResult),
-                      bool (*isConnected)()) {
+                      bool (*isConnected)(),
+                      uint32_t initialDelayMs) {
     if (_taskHandle != nullptr) return;
     _checkIntervalSec = checkIntervalSec;
+    _initialDelayMs   = initialDelayMs;
     _onResult = onResult;
     _isConnected = isConnected;
     // Run boot validation synchronously on the caller (typically the Arduino
@@ -399,6 +402,11 @@ void SimpleOTAClient::_taskEntry(void* arg) {
 }
 
 void SimpleOTAClient::_taskLoop() {
+    // Defer the first check if the caller requested an initial delay. This
+    // avoids lwIP contention (e.g. udp_remove assert) when other TLS
+    // sessions (MQTT, etc.) are starting concurrently at boot.
+    if (_initialDelayMs > 0) vTaskDelay(pdMS_TO_TICKS(_initialDelayMs));
+
     // While a trial is in progress, run the trial loop (short retry interval,
     // auto-confirm on first 2xx from /check/). Once the trial resolves, fall
     // through to the normal cadence loop. The independent FreeRTOS timer is
