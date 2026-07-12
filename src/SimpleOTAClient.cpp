@@ -18,10 +18,14 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <mbedtls/sha256.h>
+#include <memory>
+#include <new>
 #include <esp_system.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+
+#include "SimpleOTASigning.h"
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -321,6 +325,10 @@ SimpleOTAClient::SimpleOTAClient(const char* token,
       _hasOffer(false),
       _size(0),
       _buildNumber(0),
+      _offerSigned(false),
+      _offerHasSignature(false),
+      _signature{},
+      _numSigningKeys(0),
       _rollbackEnabled(true),
       _managedAutoConfirm(true),
       _confirmTimeoutSec(SIMPLEOTA_CONFIRM_TIMEOUT_S),
@@ -356,6 +364,40 @@ void SimpleOTAClient::setPartitionProfile(const char* profile){ _partitionProfil
 void SimpleOTAClient::setNvsSchemaVersion(uint8_t version)    { _nvsSchemaVersion = version; }
 void SimpleOTAClient::setLabels(const char* jsonObject)       { _labels = jsonObject; }
 void SimpleOTAClient::setSecurityMode(const char* mode)       { _securityMode = mode; }
+
+bool SimpleOTAClient::setSigningPublicKey(const char* pem) {
+    // Parse into a temporary and commit only on success, so a malformed PEM
+    // never wipes an already-pinned key: a fail-open there would silently
+    // downgrade the device to checksum-only flashing.
+    uint8_t key[32];
+    if (!sotaParseEd25519PublicKeyPem(pem, key)) {
+        SOTA_LOG("signing: rejected public key (not a valid Ed25519 SPKI PEM)");
+        return false;
+    }
+    memcpy(_signingKeys[0], key, 32);
+    _signingKeyIds[0] = "";
+    _numSigningKeys = 1;
+    SOTA_LOG("signing: pinned public key 1/%u", (unsigned)kMaxSigningKeys);
+    return true;
+}
+
+bool SimpleOTAClient::addSigningPublicKey(const char* keyId, const char* pem) {
+    if (_numSigningKeys >= kMaxSigningKeys) {
+        SOTA_LOG("signing: key limit (%u) reached, key not added",
+                 (unsigned)kMaxSigningKeys);
+        return false;
+    }
+    if (!sotaParseEd25519PublicKeyPem(pem, _signingKeys[_numSigningKeys])) {
+        SOTA_LOG("signing: rejected public key (not a valid Ed25519 SPKI PEM)");
+        return false;
+    }
+    _signingKeyIds[_numSigningKeys] = keyId ? keyId : "";
+    ++_numSigningKeys;
+    SOTA_LOG("signing: pinned public key %u/%u (id=%s)",
+             (unsigned)_numSigningKeys, (unsigned)kMaxSigningKeys,
+             keyId ? keyId : "(none)");
+    return true;
+}
 void SimpleOTAClient::setVersionLabel(const char* label)      { _versionLabel = label; }
 void SimpleOTAClient::setChannel(const char* channel)         { _channel = channel; }
 void SimpleOTAClient::setDebug(bool enabled)                  { _debugEnabled = enabled; }
@@ -495,14 +537,27 @@ void SimpleOTAClient::warnInsecureOnce() {
                      "Call setCACert(SimpleOTAClient::kSimpleOtaRootCA) for production."));
 }
 
+void SimpleOTAClient::warnUnverifiedSigned() {
+    // Always-on (not gated on setDebug): applying a signed artifact without
+    // verification silently downgrades the security the fleet operator
+    // believes they have. Fired on every such apply, not once per boot:
+    // applies are inherently rare and each is a discrete security event.
+    Serial.println(F("[SimpleOTAClient] WARNING: signed firmware offered but no "
+                     "signing key is pinned; applying WITHOUT signature "
+                     "verification. Call setSigningPublicKey() to enforce it."));
+}
+
 void SimpleOTAClient::clearOffer() {
-    _hasOffer       = false;
-    _url            = "";
-    _checksum       = "";
-    _size           = 0;
-    _deploymentId   = "";
-    _buildNumber    = 0;
-    _offeredVersion = "";
+    _hasOffer          = false;
+    _url               = "";
+    _checksum          = "";
+    _size              = 0;
+    _deploymentId      = "";
+    _buildNumber       = 0;
+    _offeredVersion    = "";
+    _offerSigned       = false;
+    _offerHasSignature = false;
+    _sigKeyId          = "";
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +721,29 @@ bool SimpleOTAClient::check() {
     String offeredVersion;
     jsonGetString(resp, "version",       offeredVersion); // optional
 
+    // Signed-firmware fields (present only when the offered artifact has
+    // security_mode "signed"; see the wiki signed-firmware guide).
+    String offerMode, sigB64, sigAlgo, sigKeyId;
+    jsonGetString(resp, "security_mode",       offerMode);  // optional
+    jsonGetString(resp, "signature",           sigB64);     // optional
+    jsonGetString(resp, "signature_algorithm", sigAlgo);    // optional
+    jsonGetString(resp, "signing_key_id",      sigKeyId);   // optional
+
+    _offerSigned       = (offerMode == SECURITY_MODE_SIGNED);
+    _sigKeyId          = sigKeyId;
+    _offerHasSignature = false;
+    if (_offerSigned && sigB64.length()) {
+        // An algorithm other than ed25519 leaves the signature unusable:
+        // verification then fails closed in apply() when keys are pinned.
+        bool algoOk = (sigAlgo.length() == 0) || (sigAlgo == "ed25519");
+        if (algoOk && sotaDecodeSignatureB64(sigB64.c_str(), _signature)) {
+            _offerHasSignature = true;
+        } else {
+            SOTA_LOG("check: signed offer carries unusable signature (algo=%s)",
+                     sigAlgo.c_str());
+        }
+    }
+
     _url            = url;
     _checksum       = checksum;
     _checksum.toLowerCase();
@@ -776,6 +854,62 @@ OTAResult SimpleOTAClient::apply() {
 
     warnInsecureOnce();
 
+    // Signed-firmware gate. Decided BEFORE the download so a rejectable
+    // offer wastes no bandwidth or flash wear. The policy is a pure,
+    // host-tested function (sotaSignedGate) so the anti-downgrade rule
+    // cannot silently regress: a device in signed mode with a pinned key
+    // MUST see a usable signature regardless of what the offer claims.
+    const bool deviceReportsSigned =
+        _securityMode && strcmp(_securityMode, SECURITY_MODE_SIGNED) == 0;
+    bool verifySignature = false;
+    switch (sotaSignedGate(deviceReportsSigned, _numSigningKeys,
+                           _offerSigned, _offerHasSignature)) {
+        case SOTA_GATE_SKIP:
+            break;
+        case SOTA_GATE_VERIFY:
+            verifySignature = true;
+            break;
+        case SOTA_GATE_WARN_UNVERIFIED:
+            warnUnverifiedSigned();
+            break;
+        case SOTA_GATE_FAIL_CLOSED:
+            SOTA_LOG("apply: signed update required but signature "
+                     "absent/unusable, rejecting");
+            sendStatus("failed", "signature_invalid");
+            clearOffer();
+            return OTA_SIGNATURE_FAIL;
+    }
+
+    // Streaming Ed25519 verifier. Heap-allocated (not a ~700 B stack local)
+    // so it does not coexist with buf[1024] + the TLS client on the managed
+    // task's stack. Allocated here, before the download, so an allocation
+    // failure fails closed rather than downgrading to checksum-only.
+    std::unique_ptr<SotaSignatureVerifier> sigVerifier;
+    if (verifySignature) {
+        // Key selection: when the offer names a key id we have pinned,
+        // verify against that key alone; otherwise try every pinned key.
+        const uint8_t (*verifyKeys)[32] = _signingKeys;
+        uint8_t numVerifyKeys = _numSigningKeys;
+        if (_sigKeyId.length()) {
+            for (uint8_t i = 0; i < _numSigningKeys; ++i) {
+                if (_signingKeyIds[i] == _sigKeyId) {
+                    verifyKeys = &_signingKeys[i];
+                    numVerifyKeys = 1;
+                    break;
+                }
+            }
+        }
+        sigVerifier.reset(new (std::nothrow) SotaSignatureVerifier());
+        if (!sigVerifier) {
+            SOTA_LOG("apply: could not allocate signature verifier, "
+                     "failing closed");
+            sendStatus("failed", "signature_invalid");
+            clearOffer();
+            return OTA_SIGNATURE_FAIL;
+        }
+        sigVerifier->begin(_signature, verifyKeys, numVerifyKeys);
+    }
+
     sendStatus("download_started", nullptr);
 
     SimpleOtaTLSClient client;
@@ -786,6 +920,8 @@ OTAResult SimpleOTAClient::apply() {
     http.setTimeout(SIMPLEOTA_TIMEOUT_MS);
     if (!http.begin(client, _url)) {
         SOTA_LOG("apply: http.begin failed");
+        http.end();  // release the connection BEFORE the status POST: the
+                     // TLS heap must be free or the report itself fails.
         sendStatus("failed", "https_begin_failed");
         clearOffer();
         return OTA_FLASH_FAIL;
@@ -796,8 +932,8 @@ OTAResult SimpleOTAClient::apply() {
         char r[32];
         snprintf(r, sizeof(r), "http_status_%d", code);
         SOTA_LOG("apply: GET firmware -> %d", code);
+        http.end();  // free the download TLS session before the status POST
         sendStatus("failed", r);
-        http.end();
         clearOffer();
         return OTA_FLASH_FAIL;
     }
@@ -809,8 +945,8 @@ OTAResult SimpleOTAClient::apply() {
 
     if (!Update.begin(expected)) {
         SOTA_LOG("apply: Update.begin failed (need=%u)", (unsigned)expected);
+        http.end();  // free the download TLS session before the status POST
         sendStatus("failed", "update_begin_failed");
-        http.end();
         clearOffer();
         return OTA_FLASH_FAIL;
     }
@@ -833,8 +969,8 @@ OTAResult SimpleOTAClient::apply() {
             mbedtls_sha256_free(&sha);
             Update.abort();
             SOTA_LOG("apply: stream error during download at %u bytes", (unsigned)total);
+            http.end();  // free the download TLS session before the status POST
             sendStatus("failed", "stream_error");
-            http.end();
             clearOffer();
             return OTA_FLASH_FAIL;
         }
@@ -845,12 +981,13 @@ OTAResult SimpleOTAClient::apply() {
             if (Update.write(buf, n) != (size_t)n) {
                 mbedtls_sha256_free(&sha);
                 Update.abort();
+                http.end();  // free the download TLS session before the status POST
                 sendStatus("failed", "update_write_failed");
-                http.end();
                 clearOffer();
                 return OTA_FLASH_FAIL;
             }
             mbedtls_sha256_update(&sha, buf, n);
+            if (verifySignature) sigVerifier->update(buf, (size_t)n);
             total += (size_t)n;
             lastByteAt = millis();
             // Keep the IDLE task fed on fast links so the task watchdog
@@ -861,8 +998,8 @@ OTAResult SimpleOTAClient::apply() {
                 mbedtls_sha256_free(&sha);
                 Update.abort();
                 SOTA_LOG("apply: download stalled at %u bytes", (unsigned)total);
+                http.end();  // free the download TLS session before the status POST
                 sendStatus("failed", "download_stalled");
-                http.end();
                 clearOffer();
                 return OTA_FLASH_FAIL;
             }
@@ -874,11 +1011,17 @@ OTAResult SimpleOTAClient::apply() {
         mbedtls_sha256_free(&sha);
         Update.abort();
         SOTA_LOG("apply: short read %u/%d", (unsigned)total, contentLen);
+        http.end();  // free the download TLS session before the status POST
         sendStatus("failed", "short_read");
-        http.end();
         clearOffer();
         return OTA_FLASH_FAIL;
     }
+
+    // The stream is fully consumed: release the download connection (and its
+    // ~45 KB TLS session) NOW, before any status POST opens its own TLS
+    // session. With MQTT also connected, three concurrent sessions exhaust
+    // the heap (field failure: mbedtls -0x7F00, lost status events).
+    http.end();
 
     sendStatus("downloaded", nullptr);
 
@@ -895,19 +1038,30 @@ OTAResult SimpleOTAClient::apply() {
                  _checksum.c_str(), hex);
         Update.abort();
         sendStatus("failed", "checksum_mismatch");
-        http.end();
         clearOffer();
         return OTA_CHECKSUM_FAIL;
+    }
+
+    // Ed25519 signature verification over the exact downloaded bytes, BEFORE
+    // Update.end() marks the new image bootable. Checked after the checksum
+    // on purpose: a signature failure here means the bytes arrived intact
+    // but were not approved by the pinned key. That is a security signal,
+    // not flakiness; the server surfaces the reason on the device row.
+    if (verifySignature && !sigVerifier->final()) {
+        SOTA_LOG("apply: signature verification FAILED (key_id=%s), rejecting image",
+                 _sigKeyId.length() ? _sigKeyId.c_str() : "(none)");
+        Update.abort();
+        sendStatus("failed", "signature_invalid");
+        clearOffer();
+        return OTA_SIGNATURE_FAIL;
     }
 
     if (!Update.end(true)) {
         SOTA_LOG("apply: Update.end failed err=%d", (int)Update.getError());
         sendStatus("failed", "update_end_failed");
-        http.end();
         clearOffer();
         return OTA_FLASH_FAIL;
     }
-    http.end();
 
     sendStatus("flashed", nullptr);
 
@@ -1025,7 +1179,9 @@ void SimpleOTAClient::processBootValidation() {
 
     Preferences p;
     if (!p.begin(kNvsNamespace, /*readOnly=*/true)) {
-        SOTA_LOG("bootval: NVS open failed");
+        // Read-only open fails when the namespace has never been written,
+        // i.e. a device that has not completed an OTA yet. Expected.
+        SOTA_LOG("bootval: no saved OTA state yet (fresh device)");
         return;
     }
     uint8_t  trial       = p.getUChar (kNvsKeyTrial,       0);
@@ -1129,9 +1285,11 @@ void SimpleOTAClient::processBootValidation() {
             uint32_t pb = rp.getUInt  (kNvsKeyPrevBuild, 0);
             String   ph = rp.getString(kNvsKeyPrevHash, "");
             String   pv = rp.getString(kNvsKeyPrevVer,  "");
-            if (pb)            rp.putUInt  (kNvsKeyBuild,   pb);
-            if (ph.length())   rp.putString(kNvsKeyHash,    ph);
-            if (pv.length())   rp.putString(kNvsKeyVersion, pv);
+            // Restore unconditionally: prev build 0 / empty strings are
+            // valid pre-OTA state (fresh device).
+            rp.putUInt  (kNvsKeyBuild,   pb);
+            rp.putString(kNvsKeyHash,    ph);
+            rp.putString(kNvsKeyVersion, pv);
             rp.putUChar(kNvsKeyTrial, 2);
             rp.end();
         }
@@ -1226,10 +1384,11 @@ void SimpleOTAClient::performRollback() {
     }
 
     // Restore the live NVS keys so the rolled-back image reports its real
-    // identity on next boot. Only restore non-empty/non-zero values.
-    if (prevBuild)         p.putUInt  (kNvsKeyBuild,   prevBuild);
-    if (prevHash.length()) p.putString(kNvsKeyHash,    prevHash);
-    if (prevVer.length())  p.putString(kNvsKeyVersion, prevVer);
+    // identity on next boot. Restore UNCONDITIONALLY: prev build 0 / empty
+    // strings are valid pre-OTA state (fresh device, first-ever update).
+    p.putUInt  (kNvsKeyBuild,   prevBuild);
+    p.putString(kNvsKeyHash,    prevHash);
+    p.putString(kNvsKeyVersion, prevVer);
 
     // Mark trial=2 so the next boot's processBootValidation() queues the
     // rolled_back report. fail_dep / fail_build are retained for the report.

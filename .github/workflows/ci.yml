@@ -23,6 +23,21 @@ jobs:
           library-manager: update
           compliance: strict
 
+  native-test:
+    name: Host unit tests (signature verification)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run signing tests
+        run: |
+          cc  -std=c99   -Wall -Wextra -Isrc -c src/monocypher.c src/monocypher-ed25519.c
+          g++ -std=c++11 -Wall -Wextra -Isrc -o test_signing \
+              test/native/test_signing.cpp src/SimpleOTASigning.cpp \
+              monocypher.o monocypher-ed25519.o
+          ./test_signing
+
   compile:
     name: Compile examples (ESP32)
     runs-on: ubuntu-latest

@@ -73,10 +73,11 @@
  * @brief Result codes returned by apply().
  */
 enum OTAResult {
-    OTA_SUCCESS       = 0,  ///< Firmware flashed and validated; reboot pending.
-    OTA_CHECKSUM_FAIL = 1,  ///< Downloaded payload did not match expected SHA-256.
-    OTA_FLASH_FAIL    = 2,  ///< Network or partition write failure.
-    OTA_NO_OFFER      = 3   ///< apply() called without a successful preceding check().
+    OTA_SUCCESS        = 0,  ///< Firmware flashed and validated; reboot pending.
+    OTA_CHECKSUM_FAIL  = 1,  ///< Downloaded payload did not match expected SHA-256.
+    OTA_FLASH_FAIL     = 2,  ///< Network or partition write failure.
+    OTA_NO_OFFER       = 3,  ///< apply() called without a successful preceding check().
+    OTA_SIGNATURE_FAIL = 4   ///< Ed25519 signature verification failed; image rejected before it was marked bootable.
 };
 
 /**
@@ -84,7 +85,8 @@ enum OTAResult {
  * @brief Over-the-air firmware update client for ESP32.
  *
  * Provides check/apply firmware update mechanics, optional lifecycle event
- * reporting, and a trial-install/rollback subsystem (v0.2.0).
+ * reporting, a trial-install/rollback subsystem (v0.2.0), and on-device
+ * Ed25519 firmware signature verification for signed artifacts (v0.4.0).
  */
 class SimpleOTAClient {
 public:
@@ -225,6 +227,54 @@ public:
      *              constants for known values. nullptr (default) = field omitted.
      */
     void setSecurityMode(const char* mode);
+
+    /**
+     * @brief Pin the project's Ed25519 public signing key (replaces any
+     *        previously pinned keys).
+     *
+     * When the server offers a build with security_mode "signed", the
+     * downloaded image's Ed25519 signature is verified against the pinned
+     * key(s) BEFORE the image is marked bootable. On mismatch the update is
+     * aborted, a "failed" event with reason "signature_invalid" is reported,
+     * and apply() returns OTA_SIGNATURE_FAIL; the device keeps running its
+     * current firmware.
+     *
+     * The public key is not a secret: compile it into the sketch. Get it
+     * from the project's "Firmware signing keys" section in the dashboard,
+     * or from GET /api/v1/projects/{id}/signing-keys/.
+     *
+     * Once a key is pinned AND setSecurityMode(SECURITY_MODE_SIGNED) is set,
+     * verification is mandatory: a signed offer whose signature is missing or
+     * does not verify is rejected, and so is an offer that arrives WITHOUT a
+     * signature at all (a server or MITM cannot downgrade the device to
+     * checksum-only by stripping the signature fields). If no key is pinned,
+     * signed offers are applied checksum-only with a warning on each such
+     * apply, which keeps basic-to-signed fleet migration flowing.
+     *
+     * On an invalid PEM this returns false and leaves any previously pinned
+     * key untouched (it does not fail open).
+     *
+     * @param pem  PEM "BEGIN PUBLIC KEY" (SubjectPublicKeyInfo) Ed25519 key,
+     *             exactly as issued by SimpleOTA. Must remain valid only for
+     *             the duration of this call (the raw key bytes are copied).
+     * @return true if the PEM parsed as an Ed25519 public key.
+     */
+    bool setSigningPublicKey(const char* pem);
+
+    /**
+     * @brief Pin an additional signing key (key rotation support, max 2).
+     *
+     * During a rotation window, pin both the outgoing and the incoming key;
+     * an offer signed with either verifies. When the offer carries a
+     * signing_key_id matching one of the given keyIds, only that key is
+     * tried; otherwise all pinned keys are tried.
+     *
+     * @param keyId  The server-side key id (e.g. "prod-2026"); may be nullptr.
+     * @param pem    PEM Ed25519 public key (copied; see setSigningPublicKey()).
+     * @return true if the key was added; false when 2 keys are already
+     *         pinned or the PEM is invalid.
+     */
+    bool addSigningPublicKey(const char* keyId, const char* pem);
 
     /**
      * @brief Set a human-readable version label for the currently-running firmware.
@@ -425,7 +475,7 @@ public:
     /// @{
     static const char* const SECURITY_MODE_BASIC;   ///< "basic"  - HTTPS + SHA-256 checksum (default).
     static const char* const SECURITY_MODE_TOKEN;   ///< "token"  - per-device token auth (partial; see wiki).
-    static const char* const SECURITY_MODE_SIGNED;  ///< "signed" - firmware signature verification (coming soon).
+    static const char* const SECURITY_MODE_SIGNED;  ///< "signed" - on-device Ed25519 firmware signature verification. Pin a key with setSigningPublicKey().
     /// @}
 
     /**
@@ -461,6 +511,16 @@ private:
     String   _deploymentId;
     uint32_t _buildNumber;
     String   _offeredVersion;      ///< Version label from the last check() offer.
+    bool     _offerSigned;         ///< Offer's security_mode == "signed".
+    bool     _offerHasSignature;   ///< _signature holds a decoded usable signature.
+    uint8_t  _signature[64];       ///< Raw Ed25519 signature from the offer.
+    String   _sigKeyId;            ///< signing_key_id from the offer (may be empty).
+
+    // Pinned signing keys (compiled into the sketch; copied at set time).
+    static const uint8_t kMaxSigningKeys = 2;
+    uint8_t  _signingKeys[kMaxSigningKeys][32];
+    String   _signingKeyIds[kMaxSigningKeys];
+    uint8_t  _numSigningKeys;
 
     // Trial-install / rollback state.
     bool          _rollbackEnabled;
@@ -491,6 +551,7 @@ private:
     void     writeVersionToNvs(const char* version);
     void     clearOffer();
     void     warnInsecureOnce();
+    void     warnUnverifiedSigned();  ///< Warn (per apply) that a signed offer is applied unverified.
 
     // Rollback internals.
     void processBootValidation();

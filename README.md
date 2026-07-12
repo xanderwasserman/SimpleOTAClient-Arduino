@@ -4,7 +4,7 @@
 
 ![Platform: ESP32](https://img.shields.io/badge/platform-ESP32-blue)
 ![Framework: Arduino](https://img.shields.io/badge/framework-Arduino-teal)
-![Version: 0.3.0](https://img.shields.io/badge/version-0.3.0-green)
+![Version: 0.4.0](https://img.shields.io/badge/version-0.4.0-green)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 Integrates your ESP32 project with SimpleOTA in a few lines: check for an update, stream and flash it with on-the-fly SHA-256 verification, and let the library handle all the protocol bookkeeping. The application owns Wi-Fi and decides when to check; this library does the rest.
@@ -23,6 +23,7 @@ Integrates your ESP32 project with SimpleOTA in a few lines: check for an update
 - [API reference](#api-reference)
 - [OTA lifecycle](#ota-lifecycle)
 - [Security](#security)
+  - [Signed firmware](#signed-firmware)
 - [Rollback](#rollback)
 - [Configuration](#configuration)
 - [Logging](#logging)
@@ -39,8 +40,9 @@ Integrates your ESP32 project with SimpleOTA in a few lines: check for an update
 - **Streaming download with on-the-fly SHA-256:** firmware is verified before the partition is committed; no second pass, no large RAM buffer.
 - **NVS build-number persistence:** the library reads and writes the SimpleOTA-assigned build number automatically.
 - **Status event reporting:** reports the full update lifecycle back to the SimpleOTA backend.
+- **On-device firmware signature verification (v0.4.0):** signed artifacts are verified against your pinned Ed25519 public key, streamed during download, before the image is ever marked bootable. See [Signed firmware](#signed-firmware).
 - **Trial install with timeout-based rollback:** the library snapshots the previous image before applying, then rolls back to it if `confirmRunning()` is not called within the configurable timeout. See [Rollback](#rollback).
-- **No third-party dependencies:** uses only libraries bundled with Arduino-ESP32 core (`HTTPClient`, `Update`, `NetworkClientSecure` / `WiFiClientSecure`, `Preferences`, `mbedtls`).
+- **No external dependencies:** uses libraries bundled with the Arduino-ESP32 core (`HTTPClient`, `Update`, `NetworkClientSecure` / `WiFiClientSecure`, `Preferences`, `mbedtls`), plus a vendored copy of [Monocypher](https://monocypher.org) 3.1.3 for Ed25519; nothing to install.
 - **Compatible with Arduino-ESP32 2.x and 3.x**.
 - **Secure by default:** the bundled ISRG Root X1 root CA is used automatically; no configuration needed for production.
 
@@ -219,6 +221,7 @@ Executes the offer stored by the most recent successful `check()`.
 | `OTA_CHECKSUM_FAIL` | Downloaded payload did not match the expected SHA-256. Partition was **not** committed. Safe to retry. |
 | `OTA_FLASH_FAIL` | Network or flash write error. Partition was not committed. |
 | `OTA_NO_OFFER` | `check()` had not been called or returned `false`. |
+| `OTA_SIGNATURE_FAIL` | Ed25519 signature verification failed for a signed artifact. Partition was **not** committed; a `failed` event with reason `signature_invalid` was reported. Treat as a security signal, not flakiness. See [Signed firmware](#signed-firmware). |
 
 > **Note on `validated`:** this event is reported after `Update.end()` succeeds (meaning "the image was flashed cleanly"), not after a successful boot. A subsequent `reboot` event is emitted immediately before `esp_restart()` on the auto-reboot path; a `confirmed` event is emitted on the first 2xx `/check/` after a successful trial confirmation (see [Rollback](#rollback)).
 
@@ -295,9 +298,23 @@ Use the provided constants to avoid typos:
 |---|---|---|
 | `SimpleOTAClient::SECURITY_MODE_BASIC` | `"basic"` | HTTPS + SHA-256 checksum verification. Default. |
 | `SimpleOTAClient::SECURITY_MODE_TOKEN` | `"token"` | Per-device token authentication. Partially implemented on the server; advisory today. |
-| `SimpleOTAClient::SECURITY_MODE_SIGNED` | `"signed"` | Firmware signature verification. Coming soon. |
+| `SimpleOTAClient::SECURITY_MODE_SIGNED` | `"signed"` | On-device Ed25519 firmware signature verification. Pin your key with `setSigningPublicKey()`; see [Signed firmware](#signed-firmware). |
 
 A raw string literal is also accepted for forward compatibility.
+
+---
+
+### `bool setSigningPublicKey(const char* pem)`
+
+Pins the project's Ed25519 **public** signing key (replacing any previously pinned keys) and enables on-device signature verification for signed artifacts. Takes the PEM exactly as issued by the SimpleOTA dashboard or API; the raw key bytes are copied, so the string need not outlive the call. Returns `false` if the PEM is not a valid Ed25519 public key.
+
+See [Signed firmware](#signed-firmware) for the full behavior contract.
+
+---
+
+### `bool addSigningPublicKey(const char* keyId, const char* pem)`
+
+Pins an additional key (maximum two) for key-rotation windows. When the server's offer names a `signing_key_id` matching one of the given `keyId`s, only that key is tried; otherwise all pinned keys are tried and the signature is accepted if it verifies under any of them. Returns `false` when two keys are already pinned or the PEM is invalid.
 
 ---
 
@@ -444,6 +461,68 @@ This mode exists only to simplify local development. **Do not use it in producti
 - Download URLs that don't begin with `https://` are rejected before any connection is made.
 - Project tokens containing CR/LF or control characters are rejected to prevent HTTP header injection.
 - The library never retries a received HTTP response; only transport-level failures trigger a retry. This prevents fleet-scale retry storms.
+
+### Signed firmware
+
+Since v0.4.0 the library verifies **Ed25519 firmware signatures on the device**, upgrading the integrity guarantee from "trust the TLS channel" to "trust only images approved by the holder of the project's private signing key". Even a fully compromised delivery path (server, storage, TLS) cannot make the device flash an unapproved image.
+
+Setup ([full guide](https://wiki.simpleota.com/guides/signed-firmware/)):
+
+```cpp
+ota.setSecurityMode(SimpleOTAClient::SECURITY_MODE_SIGNED);
+ota.setSigningPublicKey(
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MCowBQYDK2VwAyEA...your project public key...\n"
+    "-----END PUBLIC KEY-----\n");
+```
+
+The signature (delivered in the `/check/` response for signed artifacts) is verified incrementally over the exact downloaded bytes, in the same streaming pass as the SHA-256 checksum, **before** `Update.end()` marks the new image bootable. No extra RAM buffer, no second pass over flash.
+
+A device is **enforcing** once it both reports signed mode
+(`setSecurityMode(SECURITY_MODE_SIGNED)`) and has a key pinned. For an
+enforcing device the decision is made from device state, not from what the
+offer claims, so a compromised server or MITM cannot downgrade it by
+stripping the signature fields:
+
+| Offer | Enforcing? | Result |
+| --- | --- | --- |
+| Signed, valid signature | yes | Verified and flashed. |
+| Signed, tampered signature | yes | Rejected before the image is bootable. `apply()` returns `OTA_SIGNATURE_FAIL`; a `failed` event with reason `signature_invalid` is reported (shown on the dashboard device row). Device keeps its current firmware. |
+| Signature missing, or offer arrives **without** signed fields | yes | Rejected before the download even starts (same `OTA_SIGNATURE_FAIL` / `signature_invalid`). This is the anti-downgrade guarantee. |
+| Signed | no key pinned | Applied with checksum verification only, plus a `Serial` warning on each such apply. Keeps fleet migration safe (below). |
+| Not signed | not enforcing | Identical to previous releases. |
+
+#### How the server matches modes
+
+The server treats `security_mode` as a compatibility dimension: an artifact is only offered to a device when the two values are **exactly equal, or either side is blank**. A device that never calls `setSecurityMode()` reports nothing and matches every artifact. The rule is symmetric:
+
+| Device reports | `basic` artifact | `signed` artifact |
+| --- | --- | --- |
+| *(nothing)* | offered | offered |
+| `basic` | offered | **not offered** |
+| `signed` | **not offered** | offered |
+
+A blocked device does not error: it receives a normal `no_compatible_build` response and silently stays on its current build.
+
+#### Migrating a fleet from `basic` to `signed`
+
+Keys are compiled into the firmware, and the device's reported mode is changed by the firmware it runs, never by the mode of the artifact that delivered it. So:
+
+1. Ship one final **`basic`** upload whose code adds `setSigningPublicKey(...)` and `setSecurityMode(SECURITY_MODE_SIGNED)`. A `basic` artifact reaches devices reporting `basic` *and* devices that never reported a mode, so the whole fleet gets it regardless of history.
+2. Devices running it report `security_mode: "signed"` and verify every subsequent update on-device.
+3. From then on, **upload only signed artifacts**: per the matrix above, a `signed` device is never offered a `basic` artifact, so there is no quiet fallback to unsigned releases.
+
+Do not upload the migration build itself as `signed`: devices explicitly reporting `basic` will never be offered it, and devices that would accept it cannot verify it yet anyway.
+
+> **Watch for stragglers.** After migrating, check the project device list for devices still reporting `basic` (stuck on an old build): they missed the migration artifact and will receive nothing once you publish only signed uploads.
+
+**Key rotation:** create the new key server-side, ship a firmware update pinning **both** keys via `addSigningPublicKey()`, start signing with the new key, then revoke the old key server-side and drop it from the next firmware.
+
+#### Scope: this is not Secure Boot
+
+Verification runs inside the application, so the trust anchor is the firmware the device is already running. That protects the **OTA delivery path** (compromised account, leaked upload token, tampered storage, MITM); it does **not** protect the device itself. An attacker with physical access can still reflash arbitrary firmware over UART/USB via the ESP32's ROM download mode, and firmware that is already compromised will not verify itself. The hardware answer to those threats is [ESP32 Secure Boot](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/security/secure-boot-v2.html) (plus Flash Encryption), which is complementary: SimpleOTA signing protects the supply chain to the device, Secure Boot protects the device itself. Note that stock Arduino-ESP32 cores ship precompiled bootloaders built **without** Secure Boot, so enabling it requires building under ESP-IDF; on the Arduino path, OTA-level signing is the strongest firmware-integrity protection available.
+
+Ed25519 verification uses a vendored, unmodified copy of [Monocypher](https://monocypher.org) 3.1.3 (dual-licensed CC0-1.0 / BSD-2-Clause).
 
 ---
 
