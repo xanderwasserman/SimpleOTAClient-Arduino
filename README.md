@@ -9,6 +9,16 @@
 
 Integrates your ESP32 project with SimpleOTA in a few lines: check for an update, stream and flash it with on-the-fly SHA-256 verification, and let the library handle all the protocol bookkeeping. The application owns Wi-Fi and decides when to check; this library does the rest.
 
+Local OTA (ArduinoOTA, espota, ElegantOTA) is for a board on your desk. SimpleOTA is managed fleet OTA for ESP32 when those devices are in the field, without pulling you into a full IoT platform.
+
+You upload a .bin from PlatformIO, ESP-IDF, Arduino, or CI, and devices check in on their own. Eligible ones get a short-lived pre-signed URL and pull firmware straight from object storage. Rollouts can start at 5% with deterministic bucketing, so the same unit stays in the same cohort. Builds can be Ed25519-signed and verified on the device during download, before the new partition is marked bootable. After reboot there's a trial window: crash or no successful check-in, and the device rolls back.
+
+Signing here protects the delivery path. It is not Secure Boot. They stack if you already use Secure Boot.
+
+[Quickstart (project, client, first update)](https://wiki.simpleota.com/getting-started/?utm_source=arduino_lib&utm_medium=readme&utm_campaign=signup_v1)
+
+[Site](https://simpleota.com/?utm_source=arduino_lib&utm_medium=readme&utm_campaign=signup_v1)
+
 ---
 
 ## Table of contents
