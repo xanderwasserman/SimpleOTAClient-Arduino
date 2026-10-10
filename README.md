@@ -11,7 +11,7 @@ Integrates your ESP32 project with SimpleOTA in a few lines: check for an update
 
 Local OTA (ArduinoOTA, espota, ElegantOTA) is for a board on your desk. SimpleOTA is managed fleet OTA for ESP32 when those devices are in the field, without pulling you into a full IoT platform.
 
-You upload a .bin from PlatformIO, ESP-IDF, Arduino, or CI, and devices check in on their own. Eligible ones get a short-lived pre-signed URL and pull firmware straight from object storage. Rollouts can start at 5% with deterministic bucketing, so the same unit stays in the same cohort. Builds can be Ed25519-signed and verified on the device during download, before the new partition is marked bootable. After reboot, the library rolls back only once its boot validation has run and `confirmRunning()` is not called before the confirm timer expires. A crash or hang before that validation runs is not rolled back by this library, and a reboot before the timer expires starts the window over.
+You upload a .bin from PlatformIO, ESP-IDF, Arduino, or CI, and devices check in on their own. Eligible ones get a short-lived pre-signed URL and pull firmware straight from object storage. Rollouts can start at 5% with deterministic bucketing, so the same unit stays in the same cohort. Builds can be Ed25519-signed and verified on the device during download, before the new partition is marked bootable. After the reboot the new image stays pending until `confirmRunning()` runs. A crash or reset in that window is rolled back by the bootloader, and a hang during a SimpleOTA trial is reset by the RTC watchdog so that the same rollback can run.
 
 Signing here protects the delivery path. It is not Secure Boot. They stack if you already use Secure Boot.
 
@@ -51,7 +51,7 @@ Signing here protects the delivery path. It is not Secure Boot. They stack if yo
 - **NVS build-number persistence:** the library reads and writes the SimpleOTA-assigned build number automatically.
 - **Status event reporting:** reports the full update lifecycle back to the SimpleOTA backend.
 - **On-device firmware signature verification (v0.4.0):** signed artifacts are verified against your pinned Ed25519 public key, streamed during download, before the image is ever marked bootable. See [Signed firmware](#signed-firmware).
-- **Trial install with timeout-based rollback:** the library snapshots the previous image before applying, then rolls back to it if `confirmRunning()` is not called within the configurable timeout. See [Rollback](#rollback).
+- **Trial install with timeout-based rollback:** the library snapshots the previous image before applying, leaves the new image pending until `confirmRunning()`, and rolls back on a crash, a reset, a confirm timeout, or a hang caught by the RTC watchdog. See [Rollback](#rollback).
 - **No external dependencies:** uses libraries bundled with the Arduino-ESP32 core (`HTTPClient`, `Update`, `NetworkClientSecure` / `WiFiClientSecure`, `Preferences`, `mbedtls`), plus a vendored copy of [Monocypher](https://monocypher.org) 3.1.3 for Ed25519; nothing to install.
 - **Compatible with Arduino-ESP32 2.x and 3.x**.
 - **Secure by default:** the bundled ISRG Root X1 root CA is used automatically; no configuration needed for production.
@@ -368,7 +368,7 @@ In managed mode (`begin()`), controls whether the library automatically calls `c
 
 ### `void setConfirmTimeout(uint32_t seconds)`
 
-Sets the per-instance trial-install confirm timeout in seconds. Defaults to `SIMPLEOTA_CONFIRM_TIMEOUT_S` (compile-time default `300`). Clamped to `[10, 86400]`. Effective starting with the next `apply()`. See [Rollback](#rollback).
+Sets the per-instance trial-install confirm timeout in seconds. Defaults to `SIMPLEOTA_CONFIRM_TIMEOUT_S` (compile-time default `300`). Clamped to `[10, 86400]`. Call it before `begin()` or the first `check()` on a trial boot so the FreeRTOS timer and the RTC watchdog share that deadline. The FreeRTOS timer keeps the value it was started with. If the RTC watchdog is already armed, this call restarts that hardware window at the new deadline plus `SIMPLEOTA_TRIAL_WDT_MARGIN_S`. See [Rollback](#rollback).
 
 ---
 
@@ -538,9 +538,9 @@ Ed25519 verification uses a vendored, unmodified copy of [Monocypher](https://mo
 
 ## Rollback
 
-Since v0.2.0 the library supports a **library-managed trial install with timeout-based rollback**. When `apply()` succeeds, the library snapshots the outgoing image's partition address and NVS metadata, then reboots into the new firmware. On the next boot, `processBootValidation()` arms the trial when it runs from `begin()`, `check()`, `confirmRunning()`, or `isTrialInstall()`. The constructor does not arm it. If `confirmRunning()` runs before `SIMPLEOTA_CONFIRM_TIMEOUT_S` (default 300 s), the trial is sealed and the snapshot is discarded. If the confirm timer expires first, the library restores the previous partition and reboots into it.
+Since v0.2.0 the library supports a **library-managed trial install with timeout-based rollback**, and on a stock Arduino-ESP32 core it also uses the bootloader's pending-verify state. When `apply()` succeeds, the library saves the address and NVS details of the firmware it is replacing, then reboots into the new firmware. The stock bootloader is built with app rollback enabled, and the library's `verifyRollbackLater()` returns true, so `initArduino()` leaves the new image pending through `setup()`. The image stays pending until `confirmRunning()`, which marks it valid, disarms the trial watchdog, and clears the saved trial record. A crash or reset while the image is pending rolls back in the bootloader. If `confirmRunning()` is not called before `SIMPLEOTA_CONFIRM_TIMEOUT_S` runs out (300 seconds by default), the library asks the bootloader to roll back and reboot, and if that call returns it switches the saved partition itself and restarts.
 
-The timer is a one-shot FreeRTOS timer that lives only in RAM. The library never calls `esp_ota_mark_app_valid_cancel_rollback()`, stores no boot counter, and does not start a task watchdog or an interrupt watchdog. This library therefore does not roll back a crash or hang before boot validation runs — a global constructor, or `setup()` before `begin()` or the first `check()` — and it does not roll back a reboot loop that never stays up for the full timeout, because each boot that reaches validation starts the timer over. Stock Arduino-ESP32 does not cover a crash in `setup()` with bootloader app rollback either: `initArduino()` marks a pending image valid before `setup()` unless the sketch defers it, and this library does not. Call `begin()` at the start of `setup()`, before the rest of your initialization, so the timer is armed before later code runs. In polling mode, where you never call `begin()`, call `isTrialInstall()` or `check()` at that same early point: both run boot validation and do not seal the trial. `confirmRunning()` runs validation and then seals the trial in the same call, so it does not leave a rollback window open. A hang after the timer is armed still rolls back when the timeout expires, provided the FreeRTOS timer service is still running. See [Limitations](#limitations).
+On a pending SimpleOTA trial the library arms the RTC watchdog from `verifyRollbackLater()`, before `setup()`, for `SIMPLEOTA_CONFIRM_TIMEOUT_S` plus `SIMPLEOTA_TRIAL_WDT_MARGIN_S` (60 seconds). `setConfirmTimeout()` restarts that watchdog when a trial is already being watched, so call it at the top of `setup()` before a long cellular attach and the hardware window follows the new deadline. A hang before `begin()`, in `setup()`, or in `loop()` resets the chip while that watchdog is armed, including a hang the FreeRTOS timer task cannot preempt, and the bootloader then rolls the image back. Light sleep and deep sleep pause the watchdog. A hang inside a global constructor runs before `verifyRollbackLater()` and is not covered. A sketch that defines its own `verifyRollbackLater()` has to be built with `-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK`, because the library provides that symbol. `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG` leaves bootloader rollback in place and does not arm the watchdog, so a hang is not reset by this library. Every chip the Arduino-ESP32 core supports (ESP32, S2, S3, C2, C3, C5, C6, H2, and P4) has this watchdog behind `wdt_hal` and `WDT_RWDT`. A target whose build has no `hal/wdt_hal.h` skips the arm, prints that the trial hang is unprotected, and still rolls back a crash or reset through the bootloader. See [Limitations](#limitations).
 
 ### Polling mode
 
@@ -578,7 +578,7 @@ See `examples/RollbackOTA` for the full pattern.
 
 ### Cellular and other high-latency transports
 
-The default 300 s timeout assumes Wi-Fi. For cellular or other transports where attaching, registering, and reaching the API can routinely take several minutes, raise `setConfirmTimeout()` accordingly. The clamp is `[10, 86400]` seconds.
+The default 300 s timeout assumes Wi-Fi. For cellular or other transports where attaching, registering, and reaching the API can routinely take several minutes, call `setConfirmTimeout()` at the top of `setup()`, before that attach, so the RTC watchdog restarts for the longer deadline. A bring-up that runs longer than `SIMPLEOTA_CONFIRM_TIMEOUT_S` plus `SIMPLEOTA_TRIAL_WDT_MARGIN_S` before that call resets the chip and the bootloader rolls back. The clamp is `[10, 86400]` seconds. The stage register is 32 bits, so at the default slow clock the hardware window tops out at about 7.9 hours on the original ESP32, about 13.3 hours on the S2, and about 8.8 hours on the other supported chips. A longer `setConfirmTimeout()` still starts the FreeRTOS timer at the requested deadline, and the RTC watchdog fires at that hardware maximum.
 
 ### Server interaction
 
@@ -594,7 +594,7 @@ If you do not want the rollback machinery at all:
 ota.setRollbackEnabled(false);
 ```
 
-This skips the snapshot in `apply()` and the trial-boot arming entirely. Any residual trial state left in NVS from a previous boot with rollback enabled is cleaned up automatically by `processBootValidation()` on the next boot — no manual NVS clearing is needed.
+This skips the snapshot in `apply()` and the trial-boot arming entirely. Any residual trial state left in NVS from a previous boot with rollback enabled is cleaned up automatically by `processBootValidation()` on the next boot, and a pending image is marked valid so the bootloader does not keep holding it. No manual NVS clearing is needed. `-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK` is the compile-time opt-out of `verifyRollbackLater()` and the bootloader mark calls. `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG` turns off only the RTC watchdog.
 
 ---
 
@@ -607,8 +607,11 @@ Override any of the following with a `-D` compiler flag or a `#define` placed **
 | `SIMPLEOTA_TIMEOUT_MS` | `15000` | Milliseconds before an HTTP request or a stalled download is abandoned. |
 | `SIMPLEOTA_CHECK_INTERVAL_S` | `3600` | Default check interval (in seconds) used by `begin()`. Also exposed as a constant for manual scheduling in polling mode. |
 | `SIMPLEOTA_CONFIRM_TIMEOUT_S` | `300` | Default trial-install confirm timeout (in seconds). See [Rollback](#rollback). Overridable per-instance via `setConfirmTimeout()`. |
+| `SIMPLEOTA_TRIAL_WDT_MARGIN_S` | `60` | Seconds added to the confirm timeout when the RTC watchdog is armed. Read by the library `.cpp`, so override it with `-DSIMPLEOTA_TRIAL_WDT_MARGIN_S=N`. |
 | `SIMPLEOTA_TRIAL_RETRY_INTERVAL_S` | `10` | How often (in seconds) the managed task retries `/check/` while in a trial install. |
 | `SIMPLEOTA_DEBUG` | `0` | Compile-time default for verbose `[SimpleOTAClient]` logging on `Serial`. Prefer the runtime `SimpleOTAClient::setDebug(true)` toggle from your sketch; see [Logging](#logging). |
+| `SIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK` | unset | `-D` build flag. The library does not define `verifyRollbackLater()` and does not call the bootloader mark or rollback functions. Trial rollback stays on the NVS path. |
+| `SIMPLEOTA_DISABLE_TRIAL_WATCHDOG` | unset | `-D` build flag. Bootloader rollback stays. The RTC watchdog is not armed, so a hang during the trial is not reset by this library. |
 
 **Retry policy:** `check()` and status posts retry once after a 2-second delay on transport failure (HTTP code ≤ 0). They never retry on any received HTTP response. The firmware download in `apply()` does not retry; a failure returns `OTA_FLASH_FAIL` and the next `check()` cycle can try again.
 
@@ -649,7 +652,7 @@ If `Update.begin()` fails at runtime, this is the most likely cause. Verify your
 
 | Limitation | Detail |
 | --- | --- |
-| Rollback gap before boot validation runs | The library-managed rollback (see [Rollback](#rollback)) starts only when `processBootValidation()` arms the confirm timer, on the first `begin()`, `check()`, `confirmRunning()`, or `isTrialInstall()` of the new boot. The constructor does not do this. If that timer expires with no `confirmRunning()`, the library switches back to the previous partition. This library does not roll back a crash or hang before that call — a global constructor, or `setup()` before `begin()` or the first `check()` — and a reboot before the timeout starts the window over: there is no boot counter and the library does not enable a watchdog. The default Arduino-ESP32 startup marks a pending image valid in `initArduino()` before `setup()`, so the bootloader does not switch the app back on a crash in `setup()` either. Call `begin()` at the start of `setup()` (or, in polling mode, `isTrialInstall()` or `check()`) to arm the timer before the rest of your initialization; a later hang still rolls back if the FreeRTOS timer service keeps running. |
+| Hang before `verifyRollbackLater()` | A hang inside a global constructor runs before the library can arm the RTC watchdog. That hang is not reset, and the bootloader does not get a chance to roll the image back. Crashes and resets after `verifyRollbackLater()`, and hangs once the trial watchdog is armed, do roll back. Building with `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG`, or building for a target with no `hal/wdt_hal.h`, leaves hangs unprotected. The bootloader still rolls back a crash or reset unless `-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK` is set. A sketch that arms the RTC watchdog for its own use should do so from `setup()`, after this library's hook has run, and should expect a SimpleOTA trial to take that watchdog over until `confirmRunning()`. |
 | No automatic `reboot` event when `setAutoReboot(false)` | The library only emits `reboot` on the auto-reboot path it controls. Applications that drive their own restart should call `rebootForUpdate()` (which emits the event then calls `esp_restart()`) instead of `ESP.restart()` directly; see AdvancedOTA. |
 | `report()` requires a deployment context | The method needs a `deployment_id`, which only exists after a successful `check()`. The deployment context is retained through `apply()` so post-apply events (e.g. `"reboot"`) work, but `report()` returns `false` before any `check()` has succeeded. |
 | Application owns connectivity | The library is transport-agnostic and does not manage Wi-Fi, Ethernet, PPP, or reconnects. Establish a working IP connection before calling any library method, or supply an `isConnected` probe to `begin()`. |

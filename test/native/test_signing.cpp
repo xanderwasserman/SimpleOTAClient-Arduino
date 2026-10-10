@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "SimpleOTASigning.h"
+#include "SimpleOTARollback.h"
 
 static int g_failures = 0;
 
@@ -259,6 +260,40 @@ int main(void) {
           "gate: basic device, key pinned, signed offer w/o sig -> FAIL_CLOSED");
     CHECK(sotaSignedGate(false, 1, false, false) == SOTA_GATE_SKIP,
           "gate: basic device, key pinned, basic offer -> SKIP");
+
+    // --- bootloader pending-image policy ------------------------------------
+    // sotaPendingImageAction(pending, nvsOpen, trial, rollbackEnabled, prevPart, runningMatchesPrev)
+
+    CHECK(sotaPendingImageAction(true, true, 1, true, 0x20000, false) == SOTA_IMAGE_HOLD,
+          "pending: trial on the new partition stays pending");
+    CHECK(sotaPendingImageAction(true, true, 0, true, 0, false) == SOTA_IMAGE_ACCEPT,
+          "pending: no trial record is marked valid");
+    CHECK(sotaPendingImageAction(true, false, 0, true, 0, false) == SOTA_IMAGE_ACCEPT,
+          "pending: missing NVS namespace is marked valid");
+    CHECK(sotaPendingImageAction(false, true, 1, true, 0x20000, false) == SOTA_IMAGE_LEAVE,
+          "not pending: mark-valid is not called");
+    CHECK(sotaPendingImageAction(true, true, 1, false, 0x20000, false) == SOTA_IMAGE_ACCEPT,
+          "pending: rollback disabled accepts the image");
+    CHECK(sotaPendingImageAction(true, true, 1, true, 0, false) == SOTA_IMAGE_ACCEPT,
+          "pending: trial with no previous partition is accepted");
+    CHECK(sotaPendingImageAction(true, true, 1, true, 0x20000, true) == SOTA_IMAGE_ACCEPT,
+          "pending: already back on the previous partition is accepted");
+    CHECK(sotaPendingImageAction(true, true, 2, true, 0x20000, false) == SOTA_IMAGE_ACCEPT,
+          "pending: trial==2 is not held open");
+
+    CHECK(sotaTrialWatchdogAction(true, true, 1) == SOTA_WDT_ARM,
+          "watchdog: pending trial is armed");
+    CHECK(sotaTrialWatchdogAction(true, true, 0) == SOTA_WDT_DISARM,
+          "watchdog: pending without a trial record is disarmed");
+    CHECK(sotaTrialWatchdogAction(true, false, 1) == SOTA_WDT_DISARM,
+          "watchdog: unreadable NVS does not arm");
+    CHECK(sotaTrialWatchdogAction(false, true, 1) == SOTA_WDT_DISARM,
+          "watchdog: a confirmed image is not armed");
+
+    CHECK(sotaApplyBlockedWhilePending(true),
+          "apply: blocked while the running image is pending");
+    CHECK(!sotaApplyBlockedWhilePending(false),
+          "apply: allowed once the running image is not pending");
 
     printf("===========================\n");
     if (g_failures) {

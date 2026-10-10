@@ -119,6 +119,14 @@ void setup() {
                 // Unreachable here because we only reach apply() after a
                 // successful check(), but listed for completeness.
                 break;
+            case OTA_UNCONFIRMED:
+                // Running image is still pending verify. confirmRunning()
+                // keeps it, then apply() can flash this offer.
+                Serial.println("[app] image still unconfirmed; confirm before applying");
+                break;
+            case OTA_SIGNATURE_FAIL:
+                Serial.println("[app] signature rejected");
+                break;
         }
     } else {
         Serial.println("[app] no update offered");

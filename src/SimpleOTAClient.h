@@ -49,9 +49,24 @@
  *
  * After a successful apply(), the new firmware must call confirmRunning()
  * within this many seconds, or the library reboots into the previous
- * partition. See setConfirmTimeout().
+ * partition. See setConfirmTimeout(). The RTC trial watchdog, when armed,
+ * uses this value plus SIMPLEOTA_TRIAL_WDT_MARGIN_S until setConfirmTimeout()
+ * restarts it. Both are read by the library .cpp, so override them with a
+ * -D build flag. A sketch #define does not affect that translation unit.
  */
 #define SIMPLEOTA_CONFIRM_TIMEOUT_S 300
+#endif
+
+#ifndef SIMPLEOTA_TRIAL_WDT_MARGIN_S
+/**
+ * @brief Seconds added to the confirm deadline when arming the RTC watchdog.
+ *
+ * The early arm in verifyRollbackLater() happens before setup(), so it
+ * cannot see setConfirmTimeout(). The margin covers a short stretch of
+ * setup() before that call restarts the watchdog. Override with
+ * -DSIMPLEOTA_TRIAL_WDT_MARGIN_S=N.
+ */
+#define SIMPLEOTA_TRIAL_WDT_MARGIN_S 60
 #endif
 
 #ifndef SIMPLEOTA_TRIAL_RETRY_INTERVAL_S
@@ -77,7 +92,8 @@ enum OTAResult {
     OTA_CHECKSUM_FAIL  = 1,  ///< Downloaded payload did not match expected SHA-256.
     OTA_FLASH_FAIL     = 2,  ///< Network or partition write failure.
     OTA_NO_OFFER       = 3,  ///< apply() called without a successful preceding check().
-    OTA_SIGNATURE_FAIL = 4   ///< Ed25519 signature verification failed; image rejected before it was marked bootable.
+    OTA_SIGNATURE_FAIL = 4,  ///< Ed25519 signature verification failed; image rejected before it was marked bootable.
+    OTA_UNCONFIRMED    = 5   ///< Running image is still pending verify. Call confirmRunning(), then apply() again. The offer is kept.
 };
 
 /**
@@ -126,6 +142,11 @@ public:
      *
      * Reports lifecycle events to /api/v1/ota/status/. On success, persists the
      * new build number in NVS and (by default) calls esp_restart().
+     *
+     * If the running image is still pending verify, apply() returns
+     * OTA_UNCONFIRMED and leaves the offer in place. Call confirmRunning()
+     * and then apply() again. The library does not confirm an image just
+     * because a newer one is available.
      *
      * @return An OTAResult code. On OTA_SUCCESS with auto-reboot enabled
      *         (default), this function does not return.
@@ -327,9 +348,15 @@ public:
     // is responsible for calling confirmRunning() once it determines the new
     // image is healthy.
     //
-    // Limitation: an image that crashes before the library's boot-validation
-    // code runs (e.g. in a global constructor or during Serial bring-up) will
-    // reboot-loop into the bad image. See README for details.
+    // When the core is built with CONFIG_APP_ROLLBACK_ENABLE and the sketch
+    // is not built with -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK, the library
+    // defines verifyRollbackLater() so initArduino() leaves a new image
+    // pending. confirmRunning() marks that image valid. A crash or reset
+    // while it is pending rolls back in the bootloader. A hang during a
+    // SimpleOTA trial is reset by the RTC watchdog, armed from
+    // verifyRollbackLater(), unless the sketch is built with
+    // -DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG or the target has no hal/wdt_hal.h.
+    // A hang in a global constructor runs before that hook and is not covered.
     // ------------------------------------------------------------------
 
     /**
@@ -339,8 +366,10 @@ public:
      *
      * When set to false, apply() behaves as it did pre-0.2.0: write the new
      * image, reboot, and never look back. A device already in a TRIAL boot
-     * from a previous apply() will still complete that trial regardless of
-     * this flag, to avoid stranding fleets when the setting is changed.
+     * from a previous apply() has that residual trial accepted on the next
+     * processBootValidation(): the pending image is marked valid, the trial
+     * watchdog is disarmed, and the NVS trial record is cleared, so turning
+     * rollback off does not leave the bootloader holding the image.
      *
      * @param enabled  true = rollback enabled (default); false = no trial state.
      */
@@ -370,8 +399,11 @@ public:
      * increase this accordingly (e.g. setConfirmTimeout(600)).
      *
      * Call this before begin() in managed mode, or before the first check() in
-     * polling mode, on the trial boot. Changing it after the timer is armed has
-     * no effect on the current trial.
+     * polling mode, on the trial boot, so the FreeRTOS confirm timer and the
+     * RTC watchdog use the same deadline. The FreeRTOS timer keeps the value
+     * it was started with. If the RTC watchdog is already armed, this call
+     * restarts that hardware window at the new deadline plus
+     * SIMPLEOTA_TRIAL_WDT_MARGIN_S.
      *
      * @param seconds  Confirm deadline in seconds. Clamped to [10, 86400].
      */
@@ -380,9 +412,10 @@ public:
     /**
      * @brief Confirm that the currently-running firmware is healthy.
      *
-     * Cancels the rollback timer and clears trial state from NVS so subsequent
-     * boots are normal. Safe to call unconditionally from setup(), even before
-     * check() or begin().
+     * Cancels the rollback timer, disarms the trial watchdog, marks the running
+     * image valid in the bootloader, and clears trial state from NVS so
+     * subsequent boots are normal. Safe to call unconditionally from setup(),
+     * even before check() or begin().
      *
      * @return true if a trial was active and is now confirmed; false if the device
      *         was not in a trial (the call is a no-op in that case).
@@ -556,7 +589,8 @@ private:
     // Rollback internals.
     void processBootValidation();
     void snapshotPreOtaState();        ///< Called from apply() before esp_restart().
-    void performRollback();            ///< Timer callback target and explicit caller.
+    void performRollback();            ///< NVS boot-partition fallback. Does not return.
+    void rollbackExpiredTrial();       ///< Bootloader rollback, then performRollback() if that returns.
     void clearTrialState();            ///< Wipe trial snapshot keys only (sota_trial, sota_prev_*). Does NOT touch sota_fail_* or sota_conf_pend.
     void reportRolledBackIfPending();  ///< Attempt the deferred rolled_back POST.
     void reportConfirmedIfPending();   ///< Attempt the deferred confirmed POST.

@@ -26,6 +26,41 @@
 #include <esp_partition.h>
 
 #include "SimpleOTASigning.h"
+#include "SimpleOTARollback.h"
+
+// Bootloader pending-verify is compiled into stock Arduino-ESP32 2.x and 3.x
+// (CONFIG_APP_ROLLBACK_ENABLE, from CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE).
+// A sketch #define does not reach this translation unit; the opt-out is a
+// real -D, same as SIMPLEOTA_DEBUG.
+#if defined(CONFIG_APP_ROLLBACK_ENABLE) && !defined(SIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK)
+#define SOTA_BOOTLOADER_ROLLBACK 1
+#else
+#define SOTA_BOOTLOADER_ROLLBACK 0
+#endif
+
+// Every chip the Arduino-ESP32 core supports exposes this watchdog through
+// wdt_hal as WDT_RWDT: RTC_WDT on ESP32/S2/S3/C2/C3 (RWDT_DEV_GET is
+// &RTCCNTL) and LP_WDT on C5/C6/H2/P4 (rwdt_ll.h aliases LP_WDT). A target
+// whose HAL header is absent skips the arm; the bootloader path still
+// rolls back a crash or reset, and a hang is not reset by this library.
+#if SOTA_BOOTLOADER_ROLLBACK && __has_include("hal/wdt_hal.h")
+#define SOTA_WDT_HAL 1
+#include "hal/wdt_hal.h"
+#include "soc/rtc.h"
+#else
+#define SOTA_WDT_HAL 0
+#endif
+
+#if SOTA_WDT_HAL && !defined(SIMPLEOTA_DISABLE_TRIAL_WATCHDOG)
+#define SOTA_TRIAL_WDT 1
+#else
+#define SOTA_TRIAL_WDT 0
+#endif
+
+#if SOTA_BOOTLOADER_ROLLBACK
+#include "nvs.h"
+#include "nvs_flash.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -45,6 +80,129 @@ bool SimpleOTAClient::_debugEnabled = false;
     if (SimpleOTAClient::_debugEnabled) \
         Serial.printf("[SimpleOTAClient] " fmt "\n", ##__VA_ARGS__); \
 } while (0)
+
+// ---------------------------------------------------------------------------
+// Bootloader pending-verify and the RTC/LP trial watchdog
+// ---------------------------------------------------------------------------
+
+static bool s_trialWdtArmed = false;
+
+static bool sota_query_running(bool* pending, uint32_t* address) {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (address) *address = running ? running->address : 0;
+    if (pending) *pending = false;
+    if (!running) return false;
+#if SOTA_BOOTLOADER_ROLLBACK
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        if (pending) *pending = true;
+    }
+#endif
+    return true;
+}
+
+#if SOTA_WDT_HAL
+static uint32_t sota_wdt_ticks(uint32_t seconds) {
+    uint32_t hz = rtc_clk_slow_freq_get_hz();
+    if (hz == 0) hz = 1;
+    uint64_t ticks = (uint64_t)seconds * (uint64_t)hz;
+    if (ticks > 0xFFFFFFFFu) {
+        SOTA_LOG("trial watchdog clamped to the 32-bit stage maximum");
+        ticks = 0xFFFFFFFFu;
+    }
+    if (ticks < 2) ticks = 2;
+    return (uint32_t)ticks;
+}
+
+static uint32_t sota_watch_seconds(uint32_t confirmSec) {
+    uint32_t margin = SIMPLEOTA_TRIAL_WDT_MARGIN_S;
+    if (confirmSec > 0xFFFFFFFFu - margin) return 0xFFFFFFFFu;
+    return confirmSec + margin;
+}
+
+static void sota_disarm_trial_wdt() {
+    wdt_hal_context_t hal;
+    wdt_hal_init(&hal, WDT_RWDT, 0, false);
+    wdt_hal_write_protect_disable(&hal);
+    wdt_hal_set_flashboot_en(&hal, false);
+    wdt_hal_disable(&hal);
+    wdt_hal_write_protect_enable(&hal);
+    s_trialWdtArmed = false;
+}
+
+static void sota_arm_trial_wdt(uint32_t confirmSec) {
+    wdt_hal_context_t hal;
+    wdt_hal_init(&hal, WDT_RWDT, 0, false);
+    wdt_hal_write_protect_disable(&hal);
+    wdt_hal_config_stage(&hal, WDT_STAGE0,
+                         sota_wdt_ticks(sota_watch_seconds(confirmSec)),
+                         WDT_STAGE_ACTION_RESET_RTC);
+    wdt_hal_set_flashboot_en(&hal, false);
+    wdt_hal_enable(&hal);
+    wdt_hal_write_protect_enable(&hal);
+    s_trialWdtArmed = true;
+}
+#else
+static void sota_disarm_trial_wdt() { s_trialWdtArmed = false; }
+static void sota_arm_trial_wdt(uint32_t) { s_trialWdtArmed = false; }
+#endif
+
+static void sota_mark_running_valid() {
+#if SOTA_BOOTLOADER_ROLLBACK
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        SOTA_LOG("mark valid returned 0x%x", (unsigned)err);
+    }
+#endif
+}
+
+#if SOTA_BOOTLOADER_ROLLBACK
+// verifyRollbackLater() runs from initArduino(), before the core's own
+// nvs_flash_init(). A second init from initArduino() is a no-op once this
+// one has succeeded. Never erase on ESP_ERR_NVS_NO_FREE_PAGES: that would
+// destroy the trial record this read is looking for.
+static bool sota_read_trial_u8(uint8_t* trial) {
+    *trial = 0;
+    esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK) return false;
+    nvs_handle_t handle;
+    err = nvs_open("simpleota", NVS_READONLY, &handle);
+    if (err != ESP_OK) return false;
+    uint8_t value = 0;
+    err = nvs_get_u8(handle, "sota_trial", &value);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return true;
+    if (err != ESP_OK) return false;
+    *trial = value;
+    return true;
+}
+
+// Strong override of the weak symbol in esp32-hal-misc.c. C linkage, because
+// the core declares it from a .c file. Returning true on every boot keeps
+// initArduino() from marking the image valid; processBootValidation() accepts
+// a pending image that has no SimpleOTA trial record (a USB flash, for
+// example). A sketch that also defines this symbol must build with
+// -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK.
+extern "C" bool verifyRollbackLater() {
+#if SOTA_WDT_HAL
+#if SOTA_TRIAL_WDT
+    bool pending = false;
+    sota_query_running(&pending, nullptr);
+    uint8_t trial = 0;
+    bool nvsOpen = sota_read_trial_u8(&trial);
+    if (sotaTrialWatchdogAction(pending, nvsOpen, trial) == SOTA_WDT_ARM) {
+        sota_arm_trial_wdt(SIMPLEOTA_CONFIRM_TIMEOUT_S);
+    } else {
+        sota_disarm_trial_wdt();
+    }
+#else
+    sota_disarm_trial_wdt();
+#endif
+#endif
+    return true;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // NVS (build-number persistence)
@@ -409,6 +567,10 @@ void SimpleOTAClient::setConfirmTimeout(uint32_t seconds) {
     if (seconds < 10)    seconds = 10;
     if (seconds > 86400) seconds = 86400;
     _confirmTimeoutSec = seconds;
+    // The FreeRTOS timer, once started, keeps its original period. The RTC
+    // watchdog can be restarted, so a setConfirmTimeout() at the top of
+    // setup() extends the hardware window before a long attach.
+    if (s_trialWdtArmed) sota_arm_trial_wdt(_confirmTimeoutSec);
 }
 bool SimpleOTAClient::isTrialInstall() {
     processBootValidation();
@@ -842,6 +1004,21 @@ OTAResult SimpleOTAClient::apply() {
         return OTA_NO_OFFER;
     }
 
+    // A pending image must be confirmed before another one is flashed.
+    // processBootValidation() accepts a pending image that is not a SimpleOTA
+    // trial (USB flash, rollback disabled, no trial record), so this check
+    // only blocks a real unconfirmed trial. The offer is left in place.
+    processBootValidation();
+    {
+        bool pending = false;
+        sota_query_running(&pending, nullptr);
+        if (sotaApplyBlockedWhilePending(pending)) {
+            SOTA_LOG("apply: running image still pending verify");
+            sendStatus("failed", "unconfirmed_image");
+            return OTA_UNCONFIRMED;
+        }
+    }
+
     // Reject non-HTTPS download URLs. The server is expected to issue a
     // pre-signed https:// URL; anything else (especially in the absence of
     // CA pinning) would let an attacker downgrade firmware delivery.
@@ -1165,31 +1342,62 @@ void SimpleOTAClient::snapshotPreOtaState() {
 
 // One-shot boot-time check. Runs at most once per process lifetime (gated by
 // _bootValidated). Based on sota_trial value:
-//   0 / missing -> nothing to do (steady state)
+//   0 / missing -> nothing to do (steady state), except a pending image with
+//                  no trial record is marked valid so a USB flash is not stuck
 //   1           -> a trial is in flight; compare running partition to the
 //                  snapshot. If we're on the new image, arm the confirm
-//                  timer and set _inTrial. If we're somehow on the old
-//                  image (e.g., bootloader skipped) treat as already-rolled-
-//                  back and queue the report.
+//                  timer and set _inTrial. If we're on the old image, treat
+//                  as already-rolled-back and queue the report.
 //   2           -> a rollback was performed on a prior boot; queue the
 //                  rolled_back report for the next successful /check/.
+// A pending image that this function does not hold open is marked valid.
+// The early return when the namespace is missing still does that: no
+// namespace means there is no trial record.
 void SimpleOTAClient::processBootValidation() {
     if (_bootValidated) return;
     _bootValidated = true;
 
+    bool pending = false;
+    uint32_t runningAddr = 0;
+    sota_query_running(&pending, &runningAddr);
+
     Preferences p;
-    if (!p.begin(kNvsNamespace, /*readOnly=*/true)) {
+    bool nvsOpen = p.begin(kNvsNamespace, /*readOnly=*/true);
+    uint8_t  trial       = 0;
+    uint32_t prevPart    = 0;
+    uint8_t  confirmPend = 0;
+    String   pendDep;
+    uint32_t pendBuild   = 0;
+    if (nvsOpen) {
+        trial       = p.getUChar (kNvsKeyTrial,       0);
+        prevPart    = p.getUInt  (kNvsKeyPrevPart,    0);
+        confirmPend = p.getUChar (kNvsKeyConfirmPend, 0);
+        pendDep     = p.getString(kNvsKeyFailDep,     "");
+        pendBuild   = p.getUInt  (kNvsKeyFailBuild,   0);
+        p.end();
+    } else {
         // Read-only open fails when the namespace has never been written,
-        // i.e. a device that has not completed an OTA yet. Expected.
+        // i.e. a device that has not completed an OTA yet. Expected. A
+        // pending image with no trial record is still marked valid below.
         SOTA_LOG("bootval: no saved OTA state yet (fresh device)");
-        return;
     }
-    uint8_t  trial       = p.getUChar (kNvsKeyTrial,       0);
-    uint32_t prevPart    = p.getUInt  (kNvsKeyPrevPart,    0);
-    uint8_t  confirmPend = p.getUChar (kNvsKeyConfirmPend, 0);
-    String   pendDep     = p.getString(kNvsKeyFailDep,     "");
-    uint32_t pendBuild   = p.getUInt  (kNvsKeyFailBuild,   0);
-    p.end();
+
+    const bool runningMatchesPrev = (prevPart != 0 && runningAddr == prevPart);
+    const SotaImageDisposition image = sotaPendingImageAction(
+        pending, nvsOpen, trial, _rollbackEnabled, prevPart, runningMatchesPrev);
+
+    if (image == SOTA_IMAGE_ACCEPT) {
+        // Clears a watchdog armed in verifyRollbackLater() when this boot
+        // turns out not to be a trial we should hold (rollback disabled,
+        // USB flash, or already back on the previous partition). A boot
+        // that was never pending is left alone, so a watchdog the sketch
+        // armed in setup() stays armed.
+        sota_mark_running_valid();
+        sota_disarm_trial_wdt();
+        SOTA_LOG("bootval: pending image accepted (not a held SimpleOTA trial)");
+    }
+
+    if (!nvsOpen) return;
 
     // No trial in flight: the only thing that may be pending is a
     // "confirmed" report from a successful apply() on a device with
@@ -1210,7 +1418,7 @@ void SimpleOTAClient::processBootValidation() {
     // trial=2: the old boot rolled back; still surface the report.
     // trial=1: a trial was armed but we no longer roll back. Auto-confirm:
     //          surface a "confirmed" report (the new image is running) and
-    //          wipe trial state.
+    //          wipe trial state. The pending image was marked valid above.
     if (!_rollbackEnabled) {
         if (trial == 2) {
             _rolledBackPending = true;
@@ -1297,8 +1505,16 @@ void SimpleOTAClient::processBootValidation() {
         return;
     }
 
-    // We're on the new image. Arm the trial.
+    // We're on the new image. Arm the trial. Restart the RTC watchdog from
+    // the runtime deadline so setConfirmTimeout() at the top of setup() is
+    // the window that actually applies.
     _inTrial = true;
+#if SOTA_TRIAL_WDT
+    sota_arm_trial_wdt(_confirmTimeoutSec);
+#else
+    Serial.println(F("[SimpleOTAClient] trial watchdog is not armed on this "
+                     "build; a hang during the trial is not reset by the library."));
+#endif
     _confirmTimer = xTimerCreate("sota_confirm",
                                  pdMS_TO_TICKS(_confirmTimeoutSec * 1000UL),
                                  pdFALSE,   // one-shot
@@ -1306,14 +1522,14 @@ void SimpleOTAClient::processBootValidation() {
                                  &SimpleOTAClient::_confirmTimerCb);
     if (_confirmTimer == nullptr) {
         SOTA_LOG("bootval: timer alloc failed; rolling back immediately");
-        performRollback();
+        rollbackExpiredTrial();
         return;
     }
     if (xTimerStart(_confirmTimer, 0) != pdPASS) {
         SOTA_LOG("bootval: timer start failed; rolling back immediately");
         xTimerDelete(_confirmTimer, 0);
         _confirmTimer = nullptr;
-        performRollback();
+        rollbackExpiredTrial();
         return;
     }
     SOTA_LOG("bootval: TRIAL armed (timeout=%us)", (unsigned)_confirmTimeoutSec);
@@ -1331,7 +1547,19 @@ void SimpleOTAClient::_confirmTimerCb(TimerHandle_t xTimer) {
     // window without needing a mutex (bool write/read is atomic on Cortex-M).
     if (!self || !self->_inTrial) return;
     SOTA_LOG("confirm timer fired; rolling back");
-    self->performRollback();
+    self->rollbackExpiredTrial();
+}
+
+// Ask the bootloader to roll back while the NVS trial flag is still 1, so
+// the next boot still sees the trial and the previous partition and can
+// report rolled_back. esp_ota_mark_app_invalid_rollback_and_reboot() does
+// not return on success. If it does, switch the boot partition ourselves.
+void SimpleOTAClient::rollbackExpiredTrial() {
+#if SOTA_BOOTLOADER_ROLLBACK
+    esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    SOTA_LOG("bootloader rollback returned 0x%x; using NVS fallback", (unsigned)err);
+#endif
+    performRollback();
 }
 
 // Perform the rollback: set boot partition back to the snapshot, restore the
@@ -1434,6 +1662,13 @@ bool SimpleOTAClient::confirmRunning() {
         xTimerDelete(_confirmTimer, 0);
         _confirmTimer = nullptr;
     }
+    // Disarm before marking valid. A crash in between leaves the image
+    // pending with the trial record still set, so the next boot arms the
+    // watchdog again. Marking valid first and crashing before the NVS clear
+    // would let the next boot's software timer roll back an image the
+    // bootloader already accepted.
+    sota_disarm_trial_wdt();
+    sota_mark_running_valid();
     // Capture the confirm context from NVS BEFORE clearTrialState() wipes
     // it, so reportConfirmedIfPending() can POST a "confirmed" event for
     // this deployment on the next successful /check/.
