@@ -95,7 +95,7 @@ void setup() {
 
     if (ota.check()) {
         Serial.printf("[app] update offered: version=%s\n", ota.lastOfferedVersion());
-        OTAResult r = ota.apply();   // does NOT reboot on success now
+        OTAResult r = ota.apply();   // setAutoReboot(false): success returns here
         switch (r) {
             case OTA_SUCCESS:
                 Serial.println("[app] flash succeeded; finishing app work before reboot");
@@ -118,6 +118,14 @@ void setup() {
             case OTA_NO_OFFER:
                 // Unreachable here because we only reach apply() after a
                 // successful check(), but listed for completeness.
+                break;
+            case OTA_UNCONFIRMED:
+                // Running firmware has not been confirmed. confirmRunning()
+                // keeps it, then apply() can flash this offer.
+                Serial.println("[app] image still unconfirmed; confirm before applying");
+                break;
+            case OTA_SIGNATURE_FAIL:
+                Serial.println("[app] signature rejected");
                 break;
         }
     } else {

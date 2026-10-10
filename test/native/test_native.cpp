@@ -1,12 +1,12 @@
 /**
- * Host-side unit tests for SimpleOTASigning (no Arduino, no framework).
+ * Host-side unit tests for signing and rollback decisions (no Arduino).
  *
  * Build & run (from the repository root; mirrors the CI native-test job):
  *
  *   cc  -std=c99   -Wall -Wextra -Isrc -c src/monocypher.c src/monocypher-ed25519.c
- *   g++ -std=c++11 -Wall -Wextra -Isrc -o test_signing \
- *       test/native/test_signing.cpp src/SimpleOTASigning.cpp \
- *       monocypher.o monocypher-ed25519.o && ./test_signing
+ *   g++ -std=c++11 -Wall -Wextra -Isrc -o test_native \
+ *       test/native/test_native.cpp src/SimpleOTASigning.cpp \
+ *       monocypher.o monocypher-ed25519.o && ./test_native
  *
  * Covers:
  *  - RFC 8032 pure-Ed25519 test vectors through the streaming interface.
@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "SimpleOTASigning.h"
+#include "SimpleOTARollback.h"
 
 static int g_failures = 0;
 
@@ -259,6 +260,90 @@ int main(void) {
           "gate: basic device, key pinned, signed offer w/o sig -> FAIL_CLOSED");
     CHECK(sotaSignedGate(false, 1, false, false) == SOTA_GATE_SKIP,
           "gate: basic device, key pinned, basic offer -> SKIP");
+
+    // Hold only a SimpleOTA trial.
+    CHECK(sotaHoldPendingImage(true, true, 1, 0x20000, false),
+          "hold: pending trial on the new partition");
+    CHECK(!sotaHoldPendingImage(true, true, 0, 0, false),
+          "release: pending image with no trial record (ArduinoOTA / HTTPUpdate)");
+    CHECK(!sotaHoldPendingImage(true, false, 1, 0x20000, false),
+          "release: trial byte unreadable");
+    CHECK(!sotaHoldPendingImage(true, true, 1, 0, false),
+          "release: trial with no previous partition");
+    CHECK(!sotaHoldPendingImage(false, true, 1, 0x20000, false),
+          "release: image is already valid");
+    CHECK(!sotaHoldPendingImage(true, true, 1, 0x20000, true),
+          "release: already running the previous partition");
+    CHECK(sotaShouldMarkImageValid(true, true, 0, true, 0, false),
+          "mark valid: pending image that is not ours");
+    CHECK(!sotaShouldMarkImageValid(true, true, 1, true, 0x20000, false),
+          "do not mark valid: held SimpleOTA trial");
+    CHECK(sotaShouldMarkImageValid(true, true, 1, false, 0x20000, false),
+          "mark valid: rollback turned off");
+
+    // Power loss after confirm, and the timer without bootloader rollback.
+    CHECK(sotaTrialBootAction(true, false, true, 1, true, 0x20000, false, true)
+              == SOTA_TRIAL_CONFIRMED,
+          "already valid + trial record is confirmed, not rolled back");
+    CHECK(sotaTrialBootAction(true, true, true, 1, true, 0x20000, false, true)
+              == SOTA_TRIAL_HOLD,
+          "still unconfirmed trial arms the timer");
+    CHECK(sotaTrialBootAction(false, false, true, 1, true, 0x20000, false, true)
+              == SOTA_TRIAL_HOLD,
+          "without bootloader rollback the NVS timer still arms");
+    CHECK(sotaTrialBootAction(true, false, true, 1, true, 0x20000, true, true)
+              == SOTA_TRIAL_ROLLED_BACK,
+          "running the previous partition is a rollback");
+    CHECK(sotaTrialBootAction(true, true, true, 1, false, 0x20000, false, true)
+              == SOTA_TRIAL_ACCEPT_RESIDUAL,
+          "rollback disabled accepts a residual trial");
+
+    // One phase for confirm, rollback, and the confirm timeout.
+    uint8_t next = 0;
+    CHECK(sotaClaimPhase(SOTA_PHASE_TRIAL, SOTA_CLAIM_CONFIRM, &next)
+              && next == SOTA_PHASE_CONFIRMING,
+          "confirm claims TRIAL");
+    CHECK(sotaClaimPhase(SOTA_PHASE_TRIAL, SOTA_CLAIM_ROLLBACK, &next)
+              && next == SOTA_PHASE_ROLLING_BACK,
+          "rollback claims TRIAL");
+    CHECK(!sotaClaimPhase(SOTA_PHASE_CONFIRMING, SOTA_CLAIM_ROLLBACK, &next),
+          "rollback loses once confirm has claimed");
+    CHECK(!sotaTimeoutRearmAllowed(SOTA_PHASE_CONFIRMING),
+          "setConfirmTimeout does not re-arm after confirm");
+    CHECK(!sotaTimeoutRearmAllowed(SOTA_PHASE_IDLE),
+          "setConfirmTimeout does not re-arm when idle");
+    CHECK(sotaTimeoutRearmAllowed(SOTA_PHASE_TRIAL),
+          "setConfirmTimeout re-arms during a trial");
+
+    // Timer period past 4294 seconds.
+    CHECK(sotaConfirmTimerTicks(7200, 1000) == 7200000u,
+          "7200 s at 1000 Hz is 7200000 ticks");
+    CHECK(sotaConfirmTimerTicks(86400, 1000) == 86400000u,
+          "86400 s at 1000 Hz is 86400000 ticks");
+
+    // Watchdog margin and calibrated slow clock.
+    CHECK(sotaWatchMarginSec(300, 60) == 60u, "300 s margin stays at 60 s");
+    CHECK(sotaWatchMarginSec(7200, 60) == 720u, "7200 s margin is 10 percent");
+    CHECK(sotaWatchMarginSec(100, 60) == 60u, "short timeout keeps the 60 s floor");
+    const uint64_t us = 360ull * 1000000ull;
+    const uint32_t cal = (uint32_t)(((uint64_t)1000000 << 19) / 150000u);
+    CHECK(sotaSlowclkTicks(us, cal) > 0, "calibrated ticks are non-zero");
+    CHECK(sotaSlowclkTicks(us, 0) == 0, "a zero calibration asks for the nominal fallback");
+
+    // Rollback reason.
+    CHECK(strcmp(sotaRollbackReason(SOTA_RST_PANIC, "confirm_timeout"),
+                 "confirm_timeout") == 0,
+          "stored confirm_timeout wins over the software reset");
+    CHECK(strcmp(sotaRollbackReason(SOTA_RST_PANIC, ""), "panic") == 0,
+          "panic reset with no stored reason");
+    CHECK(strcmp(sotaRollbackReason(SOTA_RST_WDT, nullptr), "watchdog") == 0,
+          "chip watchdog reset");
+    CHECK(strcmp(sotaRollbackReason(SOTA_RST_SW, nullptr), "reset") == 0,
+          "software reset with no stored reason");
+    CHECK(strcmp(sotaReportRollbackReason("panic"), "panic") == 0,
+          "the report sends the reason saved when the rollback was detected");
+    CHECK(strcmp(sotaReportRollbackReason(""), "reset") == 0,
+          "a missing saved reason is not taken from a later boot");
 
     printf("===========================\n");
     if (g_failures) {

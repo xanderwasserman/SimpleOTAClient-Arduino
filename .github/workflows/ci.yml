@@ -1,5 +1,4 @@
-# Lints the library with arduino-lint and compiles all examples against
-# Arduino-ESP32 on every push and PR to main.
+# Lint, host tests, and compile the examples against Arduino-ESP32.
 
 name: CI
 
@@ -24,22 +23,22 @@ jobs:
           compliance: strict
 
   native-test:
-    name: Host unit tests (signature verification)
+    name: Host unit tests
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and run signing tests
+      - name: Build and run host tests
         run: |
           cc  -std=c99   -Wall -Wextra -Isrc -c src/monocypher.c src/monocypher-ed25519.c
-          g++ -std=c++11 -Wall -Wextra -Isrc -o test_signing \
-              test/native/test_signing.cpp src/SimpleOTASigning.cpp \
+          g++ -std=c++11 -Wall -Wextra -Isrc -o test_native \
+              test/native/test_native.cpp src/SimpleOTASigning.cpp \
               monocypher.o monocypher-ed25519.o
-          ./test_signing
+          ./test_native
 
   compile:
-    name: Compile examples (ESP32)
+    name: Compile examples (latest ESP32 core)
     runs-on: ubuntu-latest
 
     steps:
@@ -63,3 +62,133 @@ jobs:
         with:
           name: sketches-reports
           path: sketches-reports
+
+  compile-cores:
+    name: Compile ${{ matrix.board }} (${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2.0.17"
+            board: esp32
+            fqbn: esp32:esp32:esp32
+            sketch: examples/BasicOTA
+          - version: "2.0.17"
+            board: esp32s2
+            fqbn: esp32:esp32:esp32s2
+            sketch: examples/BasicOTA
+          - version: "2.0.17"
+            board: esp32s3
+            fqbn: esp32:esp32:esp32s3
+            sketch: examples/BasicOTA
+          - version: "2.0.17"
+            board: esp32c3
+            fqbn: esp32:esp32:esp32c3
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32
+            fqbn: esp32:esp32:esp32
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32s2
+            fqbn: esp32:esp32:esp32s2
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32s3
+            fqbn: esp32:esp32:esp32s3
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32c3
+            fqbn: esp32:esp32:esp32c3
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32c5
+            fqbn: esp32:esp32:esp32c5
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32c6
+            fqbn: esp32:esp32:esp32c6
+            sketch: examples/BasicOTA
+          - version: "3.3.0"
+            board: esp32h2
+            fqbn: esp32:esp32:esp32h2
+            sketch: examples/CompileCheck  # no Wi-Fi radio, so compile CompileCheck
+          - version: "3.3.0"
+            board: esp32p4
+            fqbn: esp32:esp32:esp32p4
+            sketch: examples/BasicOTA
+          # ESP32-C2 is skipped because core 3.3.0 ships no C2 libraries.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile sketch
+        uses: arduino/compile-sketches@v1
+        with:
+          fqbn: ${{ matrix.fqbn }}
+          platforms: |
+            - name: esp32:esp32
+              version: ${{ matrix.version }}
+              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          libraries: |
+            - source-path: ./
+          sketch-paths: |
+            - ${{ matrix.sketch }}
+
+  verify-rollback-symbol:
+    name: wdt_hal_init (${{ matrix.board }} ${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2.0.17"
+            board: esp32s2
+            fqbn: esp32:esp32:esp32s2
+          - version: "2.0.17"
+            board: esp32c3
+            fqbn: esp32:esp32:esp32c3
+          - version: "3.3.0"
+            board: esp32
+            fqbn: esp32:esp32:esp32
+          - version: "3.3.0"
+            board: esp32c6
+            fqbn: esp32:esp32:esp32c6
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Compile and require wdt_hal_init
+        run: |
+          set -euo pipefail
+          arduino-cli config init || true
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${{ matrix.version }}
+          arduino-cli compile --fqbn ${{ matrix.fqbn }} \
+            --library "$PWD" \
+            --build-path "$PWD/build" \
+            examples/BasicOTA/BasicOTA.ino
+          wdt=$(find build -name 'SimpleOTAWdt.c.o' | head -1)
+          test -n "$wdt"
+          echo "watchdog object: $wdt"
+          cpp=$(find build -name 'SimpleOTAClient.cpp.o' | head -1)
+          test -n "$cpp"
+          echo "client object: $cpp"
+          NM=""
+          while IFS= read -r candidate; do
+            if "$candidate" "$wdt" >/tmp/sota-wdt-nm.txt 2>/dev/null; then
+              NM="$candidate"
+              break
+            fi
+          done < <(find "$HOME/.arduino15/packages/esp32" -type f -name '*-nm' | sort)
+          test -n "$NM"
+          echo "nm: $NM"
+          echo "wdt_hal_init reference:"
+          grep -E '(^|[[:space:]])U[[:space:]]+wdt_hal_init$' /tmp/sota-wdt-nm.txt
+          "$NM" "$cpp" | tee /tmp/sota-cpp-nm.txt
+          grep -E ' T verifyRollbackLater$' /tmp/sota-cpp-nm.txt

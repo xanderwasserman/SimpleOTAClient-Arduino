@@ -14,6 +14,12 @@
 //
 // IMPORTANT: confirmRunning() MUST be called before the timeout expires, or
 // the device will roll back. Don't gate it on something that may never happen.
+//
+// During a trial, call confirmRunning() before esp_deep_sleep_start().
+// Waking from deep sleep boots the chip again. The confirm time and the
+// chip watchdog both start over. A device that sleeps before confirming can
+// stay unconfirmed for as long as it keeps sleeping. The first reset that
+// is not a deep-sleep wake then switches back to the previous firmware.
 
 #include <WiFi.h>
 #include <SimpleOTAClient.h>
