@@ -1,5 +1,9 @@
-# Lints the library with arduino-lint and compiles all examples against
-# Arduino-ESP32 on every push and PR to main.
+# Lints the library with arduino-lint, runs host tests, and compiles
+# examples against Arduino-ESP32 on every push and PR to main.
+#
+# compile-cores covers core 2.0.17 (ESP32, S2, S3, C3) and core 3.3.0
+# (those plus C2, C5, C6, H2, P4). One sketch per cell is enough to compile
+# the library. The latest-core job still compiles every example.
 
 name: CI
 
@@ -24,22 +28,22 @@ jobs:
           compliance: strict
 
   native-test:
-    name: Host unit tests (signature verification)
+    name: Host unit tests
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and run signing tests
+      - name: Build and run host tests
         run: |
           cc  -std=c99   -Wall -Wextra -Isrc -c src/monocypher.c src/monocypher-ed25519.c
-          g++ -std=c++11 -Wall -Wextra -Isrc -o test_signing \
-              test/native/test_signing.cpp src/SimpleOTASigning.cpp \
+          g++ -std=c++11 -Wall -Wextra -Isrc -o test_native \
+              test/native/test_native.cpp src/SimpleOTASigning.cpp \
               monocypher.o monocypher-ed25519.o
-          ./test_signing
+          ./test_native
 
   compile:
-    name: Compile examples (ESP32)
+    name: Compile examples (latest ESP32 core)
     runs-on: ubuntu-latest
 
     steps:
@@ -63,3 +67,84 @@ jobs:
         with:
           name: sketches-reports
           path: sketches-reports
+
+  compile-cores:
+    name: Compile BasicOTA (${{ matrix.version }} ${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2.0.17"
+            board: esp32
+          - version: "2.0.17"
+            board: esp32s2
+          - version: "2.0.17"
+            board: esp32s3
+          - version: "2.0.17"
+            board: esp32c3
+          - version: "3.3.0"
+            board: esp32
+          - version: "3.3.0"
+            board: esp32s2
+          - version: "3.3.0"
+            board: esp32s3
+          - version: "3.3.0"
+            board: esp32c3
+          - version: "3.3.0"
+            board: esp32c2
+          - version: "3.3.0"
+            board: esp32c5
+          - version: "3.3.0"
+            board: esp32c6
+          - version: "3.3.0"
+            board: esp32h2
+          - version: "3.3.0"
+            board: esp32p4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile BasicOTA
+        uses: arduino/compile-sketches@v1
+        with:
+          fqbn: esp32:esp32:${{ matrix.board }}
+          platforms: |
+            - name: esp32:esp32
+              version: ${{ matrix.version }}
+              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          libraries: |
+            - source-path: ./
+          sketch-paths: |
+            - examples/BasicOTA
+
+  verify-rollback-symbol:
+    name: verifyRollbackLater comes from the library
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Compile and check the strong symbol
+        run: |
+          set -euo pipefail
+          arduino-cli config init || true
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.0
+          arduino-cli compile --fqbn esp32:esp32:esp32 \
+            --library "$PWD" \
+            --build-path "$PWD/build" \
+            examples/BasicOTA/BasicOTA.ino
+          obj=$(find build -name 'SimpleOTAClient.cpp.o' | head -1)
+          test -n "$obj"
+          echo "object: $obj"
+          NM=$(find "$HOME/.arduino15/packages/esp32" -type f \( \
+            -name 'xtensa-esp32-elf-nm' -o -name 'xtensa-esp-elf-nm' \) | head -1)
+          test -n "$NM"
+          echo "nm: $NM"
+          "$NM" "$obj" | tee /tmp/sota-nm.txt
+          grep -E ' T verifyRollbackLater$' /tmp/sota-nm.txt

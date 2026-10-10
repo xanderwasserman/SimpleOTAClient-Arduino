@@ -2,7 +2,7 @@
  * SimpleOTASigning.h - Ed25519 firmware-signature helpers for SimpleOTAClient.
  *
  * Portable (no Arduino dependencies) so it can be unit-tested on a host
- * machine with plain g++; see test/native/test_signing.cpp.
+ * machine with plain g++; see test/native/test_native.cpp.
  *
  * The SimpleOTA server delivers, for artifacts uploaded with
  * security_mode "signed", a base64 Ed25519 signature computed over the raw

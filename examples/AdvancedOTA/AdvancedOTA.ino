@@ -120,7 +120,7 @@ void setup() {
                 // successful check(), but listed for completeness.
                 break;
             case OTA_UNCONFIRMED:
-                // Running image is still pending verify. confirmRunning()
+                // Running firmware has not been confirmed. confirmRunning()
                 // keeps it, then apply() can flash this offer.
                 Serial.println("[app] image still unconfirmed; confirm before applying");
                 break;
