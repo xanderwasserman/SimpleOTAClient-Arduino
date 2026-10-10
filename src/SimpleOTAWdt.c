@@ -1,8 +1,6 @@
 /*
- * Chip watchdog for a SimpleOTA trial. This is C on purpose. Arduino-ESP32
- * 2.0.17's hal/wdt_hal.h pulls in mwdt_ll.h, and that header does not compile
- * as C++ on the S2 and the C3. The calls below are the same wdt_hal sequence
- * the C++ file used to make.
+ * Trial watchdog, in C. hal/wdt_hal.h does not compile as C++ on the S2
+ * and the C3 in core 2.0.17.
  */
 
 #include "sdkconfig.h"

@@ -261,7 +261,7 @@ int main(void) {
     CHECK(sotaSignedGate(false, 1, false, false) == SOTA_GATE_SKIP,
           "gate: basic device, key pinned, basic offer -> SKIP");
 
-    // --- hold the image only for a real SimpleOTA trial (M1) ---------------
+    // Hold only a SimpleOTA trial.
     CHECK(sotaHoldPendingImage(true, true, 1, 0x20000, false),
           "hold: pending trial on the new partition");
     CHECK(!sotaHoldPendingImage(true, true, 0, 0, false),
@@ -281,7 +281,7 @@ int main(void) {
     CHECK(sotaShouldMarkImageValid(true, true, 1, false, 0x20000, false),
           "mark valid: rollback turned off");
 
-    // --- power loss after confirm, and the NVS-only timer (M2) -------------
+    // Power loss after confirm, and the timer without bootloader rollback.
     CHECK(sotaTrialBootAction(true, false, true, 1, true, 0x20000, false, true)
               == SOTA_TRIAL_CONFIRMED,
           "already valid + trial record is confirmed, not rolled back");
@@ -298,7 +298,7 @@ int main(void) {
               == SOTA_TRIAL_ACCEPT_RESIDUAL,
           "rollback disabled accepts a residual trial");
 
-    // --- one phase so confirm, rollback, and timeout cannot race (S3/S4) ---
+    // One phase for confirm, rollback, and the confirm timeout.
     uint8_t next = 0;
     CHECK(sotaClaimPhase(SOTA_PHASE_TRIAL, SOTA_CLAIM_CONFIRM, &next)
               && next == SOTA_PHASE_CONFIRMING,
@@ -315,13 +315,13 @@ int main(void) {
     CHECK(sotaTimeoutRearmAllowed(SOTA_PHASE_TRIAL),
           "setConfirmTimeout re-arms during a trial");
 
-    // --- timer period does not wrap past 4294 s (S1) -----------------------
+    // Timer period past 4294 seconds.
     CHECK(sotaConfirmTimerTicks(7200, 1000) == 7200000u,
           "7200 s at 1000 Hz is 7200000 ticks");
     CHECK(sotaConfirmTimerTicks(86400, 1000) == 86400000u,
           "86400 s at 1000 Hz is 86400000 ticks");
 
-    // --- proportional margin and calibrated slow clock (S5) ----------------
+    // Watchdog margin and calibrated slow clock.
     CHECK(sotaWatchMarginSec(300, 60) == 60u, "300 s margin stays at 60 s");
     CHECK(sotaWatchMarginSec(7200, 60) == 720u, "7200 s margin is 10 percent");
     CHECK(sotaWatchMarginSec(100, 60) == 60u, "short timeout keeps the 60 s floor");
@@ -330,7 +330,7 @@ int main(void) {
     CHECK(sotaSlowclkTicks(us, cal) > 0, "calibrated ticks are non-zero");
     CHECK(sotaSlowclkTicks(us, 0) == 0, "a zero calibration asks for the nominal fallback");
 
-    // --- rollback reason (S7) ----------------------------------------------
+    // Rollback reason.
     CHECK(strcmp(sotaRollbackReason(SOTA_RST_PANIC, "confirm_timeout"),
                  "confirm_timeout") == 0,
           "stored confirm_timeout wins over the software reset");

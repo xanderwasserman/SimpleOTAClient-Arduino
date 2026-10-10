@@ -95,7 +95,7 @@ void setup() {
 
     if (ota.check()) {
         Serial.printf("[app] update offered: version=%s\n", ota.lastOfferedVersion());
-        OTAResult r = ota.apply();   // does NOT reboot on success now
+        OTAResult r = ota.apply();   // setAutoReboot(false): success returns here
         switch (r) {
             case OTA_SUCCESS:
                 Serial.println("[app] flash succeeded; finishing app work before reboot");

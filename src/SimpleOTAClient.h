@@ -102,8 +102,8 @@ enum OTAResult {
  * @brief Over-the-air firmware update client for ESP32.
  *
  * Provides check/apply firmware update mechanics, optional lifecycle event
- * reporting, a trial-install/rollback subsystem (v0.2.0), and on-device
- * Ed25519 firmware signature verification for signed artifacts (v0.4.0).
+ * reporting, a trial-install/rollback subsystem, and on-device
+ * Ed25519 firmware signature verification for signed artifacts.
  *
  * Use one SimpleOTAClient in a firmware. The trial phase is shared by the
  * whole program, so a second instance would confirm or roll back the same
@@ -340,7 +340,7 @@ public:
     const char* lastOfferedVersion() const;
 
     // ------------------------------------------------------------------
-    // Trial-install / rollback API (v0.2.0)
+    // Trial-install / rollback API
     //
     // After a successful apply() that reboots into a new image, the device
     // enters a "trial" state. The new firmware must call confirmRunning()
@@ -373,8 +373,8 @@ public:
      *
      * Default: true.
      *
-     * When set to false, apply() behaves as it did pre-0.2.0: write the new
-     * image, reboot, and never look back. A device already in a TRIAL boot
+     * When set to false, apply() writes the new image, reboots, and does not
+     * start a trial. A device already in a TRIAL boot
      * from a previous apply() has that residual trial accepted on the next
      * processBootValidation(): the pending image is marked valid, the trial
      * watchdog is disarmed, and the NVS trial record is cleared, so turning

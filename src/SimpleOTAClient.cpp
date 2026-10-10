@@ -29,15 +29,10 @@
 #include "SimpleOTASigning.h"
 #include "SimpleOTARollback.h"
 
-// The CONFIG_* checks below have to see sdkconfig.h themselves. Do not rely
-// on HTTPClient.h or another header to include it. SimpleOTAWdt.c includes
-// the same header before its own gate.
+// The core does not force-include sdkconfig.h. SimpleOTAWdt.c includes it too.
 #include "sdkconfig.h"
 
-// Bootloader pending-verify is compiled into stock Arduino-ESP32 2.x and 3.x
-// (CONFIG_APP_ROLLBACK_ENABLE, from CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE).
-// A sketch #define does not reach this translation unit; the opt-out is a
-// real -D, same as SIMPLEOTA_DEBUG.
+// A sketch #define does not reach this file. The opt-out is a real -D.
 #if (defined(CONFIG_APP_ROLLBACK_ENABLE) || defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)) \
     && !defined(SIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK)
 #define SOTA_BOOTLOADER_ROLLBACK 1
@@ -49,15 +44,10 @@
 #warning "CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP is not set. A deep-sleep wake during a SimpleOTA trial can roll the image back. Call confirmRunning() before esp_deep_sleep_start()."
 #endif
 
-// The chip watchdog lives in SimpleOTAWdt.c. That file is C because
-// hal/wdt_hal.h does not compile as C++ on the S2 and the C3 in core 2.0.17.
-// Stock cores build it for the ESP32, S2, S3, C3, C5, C6, H2, and P4, through
-// wdt_hal WDT_RWDT: RTC_WDT on ESP32/S2/S3/C3 and LP_WDT on C5/C6/H2/P4.
-// The stock 3.x core does not build the ESP32-C2. That chip is reachable
-// when Arduino is an ESP-IDF component, and the project must enable app
-// rollback in its own sdkconfig, which ESP-IDF leaves off by default.
-// A target with no hal/wdt_hal.h skips the arm. A crash or a reset still
-// rolls back. A hang does not.
+// SimpleOTAWdt.c is C because hal/wdt_hal.h does not compile as C++ on the
+// S2 and the C3 in core 2.0.17. The stock 3.x core does not build the
+// ESP32-C2. That chip is reachable as an ESP-IDF component, and the project
+// must enable app rollback in its sdkconfig, which ESP-IDF leaves off.
 
 #if SOTA_BOOTLOADER_ROLLBACK
 #include "nvs.h"
@@ -154,9 +144,8 @@ static bool sota_read_trial(uint8_t* trial, uint32_t* prevPart) {
     return true;
 }
 
-// On the boot that finds itself back on the previous partition, store the
-// reset reason before setup(). The key matches kNvsKeyRbWhy. A value already
-// stored, including confirm_timeout, is left alone. Never erase NVS here.
+// Back on the previous partition, store this boot's reset reason when
+// sota_rb_why is empty. Do not erase NVS.
 static void sota_save_detected_rollback_reason(void) {
     if (nvs_flash_init() != ESP_OK) return;
     nvs_handle_t handle;
@@ -173,14 +162,10 @@ static void sota_save_detected_rollback_reason(void) {
     nvs_close(handle);
 }
 
-// Strong override of the weak symbol in esp32-hal-misc.c. C linkage, because
-// the core declares it from a .c file. This definition stays in this file so
-// a PlatformIO archived library still pulls the strong symbol in with the
-// class. Returning true keeps initArduino() from marking the image valid.
-// That is done only for a pending image that has a SimpleOTA trial record
-// for a different partition. Every other boot returns false, and the core
-// accepts the image the way it did before this library defined the hook.
-// A sketch that also defines this symbol must build with
+// Strong override of the weak symbol in esp32-hal-misc.c. C linkage matches
+// the core's .c declaration. Keep this definition in this file: a PlatformIO
+// archive pulls the object in with the class, and a separate file would lose
+// to the weak symbol. A sketch that also defines it must build with
 // -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK.
 extern "C" bool verifyRollbackLater() {
     bool pending = false;
@@ -1324,7 +1309,7 @@ OTAResult SimpleOTAClient::apply() {
 }
 
 // ---------------------------------------------------------------------------
-// Rollback / trial-install machinery (v0.2.0)
+// Rollback / trial-install machinery
 // ---------------------------------------------------------------------------
 
 // Snapshot the CURRENT (about-to-be-replaced) image identity into NVS so a
@@ -1355,21 +1340,7 @@ void SimpleOTAClient::snapshotPreOtaState() {
              (unsigned)running->address, (unsigned)prevBuild);
 }
 
-// One-shot boot-time check. Runs at most once per process lifetime (gated by
-// _bootValidated). sotaTrialBootAction() chooses the trial outcome:
-//   none       -> no trial record. A pending image with no trial record is
-//                 marked valid, which is how ArduinoOTA and HTTPUpdate images
-//                 are accepted once the sketch calls into the library.
-//   hold       -> trial on the new image. Arm the confirm timer.
-//   confirmed  -> trial record, but the running image is already valid and
-//                 this is not the previous partition. Power was lost after
-//                 confirmRunning() marked the image valid. Queue confirmed
-//                 and do not arm the timer or the watchdog.
-//   rolled back-> already on the previous partition, or trial was saved as 2.
-//   clear      -> snapshot is incomplete.
-//   residual   -> rollback was turned off. Accept and drop the record.
-// A pending image that this function does not hold open is marked valid.
-// The early return when the namespace is missing still does that.
+// Once per process. sotaTrialBootAction() picks the outcome.
 void SimpleOTAClient::processBootValidation() {
     if (_bootValidated) return;
     _bootValidated = true;

@@ -1,22 +1,4 @@
-# Lints the library with arduino-lint, runs host tests, and compiles
-# examples against Arduino-ESP32 on every push and PR to main.
-#
-# compile-cores covers core 2.0.17 (ESP32, S2, S3, C3) and core 3.3.0
-# (those plus C5, C6, H2, P4). Wi-Fi boards compile BasicOTA. The H2 has no
-# Wi-Fi radio, so that cell compiles examples/CompileCheck, which does not
-# include WiFi.h and calls confirmRunning().
-#
-# ESP32-C2 is listed in core 3.3.0 boards.txt (FlashMode qio or dio, FlashFreq
-# 60 or 30). lib-builder configs/builds.json marks that target "skip": 1, and
-# the 3.3.0 libs zip idf-release_v5.5-b66b5448-v1 has no esp32c2 directory.
-# None of bootloader_qio_60m, bootloader_dio_60m, bootloader_qio_30m, or
-# bootloader_dio_30m is shipped, so no FlashFreq board option can compile C2
-# on this core. The latest-core job still compiles every example on the
-# original ESP32.
-#
-# verify-rollback-symbol compiles 2.0.17 S2 and C3 and 3.3.0 ESP32 and C6,
-# then fails unless SimpleOTAWdt.c.o references wdt_hal_init and
-# SimpleOTAClient.cpp.o defines verifyRollbackLater.
+# Lint, host tests, and compile the examples against Arduino-ESP32.
 
 name: CI
 
@@ -131,11 +113,12 @@ jobs:
           - version: "3.3.0"
             board: esp32h2
             fqbn: esp32:esp32:esp32h2
-            sketch: examples/CompileCheck
+            sketch: examples/CompileCheck  # no Wi-Fi radio, so compile CompileCheck
           - version: "3.3.0"
             board: esp32p4
             fqbn: esp32:esp32:esp32p4
             sketch: examples/BasicOTA
+          # ESP32-C2 is skipped because core 3.3.0 ships no C2 libraries.
 
     steps:
       - uses: actions/checkout@v4
