@@ -196,9 +196,10 @@ enum {
 };
 
 /**
- * Reason string for a rolled_back report. A reason stored before this
- * library reboots wins, so a software reset from the confirm timer stays
- * confirm_timeout. Otherwise the reset that entered the bootloader is used.
+ * Reason to save on the boot that detects the rollback. A reason already
+ * stored before this library reboots wins, so a software reset from the
+ * confirm timer stays confirm_timeout. Otherwise this boot's reset reason
+ * is used. Call this while detecting the rollback, then persist the result.
  */
 static inline const char* sotaRollbackReason(int resetCode, const char* stored)
 {
@@ -214,6 +215,17 @@ static inline const char* sotaRollbackReason(int resetCode, const char* stored)
         case SOTA_RST_SW:        return "reset";
         default:                 return "reset";
     }
+}
+
+/**
+ * Reason to send with a rolled_back report. This is only the value saved
+ * when the rollback was detected. It does not look at the reset reason of
+ * the boot that finally reaches the server.
+ */
+static inline const char* sotaReportRollbackReason(const char* stored)
+{
+    if (stored && stored[0] != '\0') return stored;
+    return "reset";
 }
 
 /*

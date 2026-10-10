@@ -5,6 +5,8 @@
 
 SimpleOTAClient ota("token", SimpleOTAClient::CHIP_ESP32);
 
-void setup() {}
+void setup() {
+    ota.confirmRunning();
+}
 
 void loop() {}

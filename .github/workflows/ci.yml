@@ -2,11 +2,17 @@
 # examples against Arduino-ESP32 on every push and PR to main.
 #
 # compile-cores covers core 2.0.17 (ESP32, S2, S3, C3) and core 3.3.0
-# (those plus C5, C6, H2, P4). One sketch per cell is enough to compile
-# the library. CompileCheck does not include WiFi.h, because the H2 has no
-# Wi-Fi radio. Core 3.3.0's prebuilt libs package has no esp32c2 folder, so
-# that board's bootloader ELF is not shipped and this matrix does not build
-# it. The latest-core job still compiles every example on the original ESP32.
+# (those plus C5, C6, H2, P4). Wi-Fi boards compile BasicOTA. The H2 has no
+# Wi-Fi radio, so that cell compiles examples/CompileCheck, which does not
+# include WiFi.h and calls confirmRunning().
+#
+# ESP32-C2 is listed in core 3.3.0 boards.txt (FlashMode qio or dio, FlashFreq
+# 60 or 30). lib-builder configs/builds.json marks that target "skip": 1, and
+# the 3.3.0 libs zip idf-release_v5.5-b66b5448-v1 has no esp32c2 directory.
+# None of bootloader_qio_60m, bootloader_dio_60m, bootloader_qio_30m, or
+# bootloader_dio_30m is shipped, so no FlashFreq board option can compile C2
+# on this core. The latest-core job still compiles every example on the
+# original ESP32.
 
 name: CI
 
@@ -72,7 +78,7 @@ jobs:
           path: sketches-reports
 
   compile-cores:
-    name: Compile BasicOTA (${{ matrix.version }} ${{ matrix.board }})
+    name: Compile ${{ matrix.board }} (${{ matrix.version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -80,36 +86,60 @@ jobs:
         include:
           - version: "2.0.17"
             board: esp32
+            fqbn: esp32:esp32:esp32
+            sketch: examples/BasicOTA
           - version: "2.0.17"
             board: esp32s2
+            fqbn: esp32:esp32:esp32s2
+            sketch: examples/BasicOTA
           - version: "2.0.17"
             board: esp32s3
+            fqbn: esp32:esp32:esp32s3
+            sketch: examples/BasicOTA
           - version: "2.0.17"
             board: esp32c3
+            fqbn: esp32:esp32:esp32c3
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32
+            fqbn: esp32:esp32:esp32
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32s2
+            fqbn: esp32:esp32:esp32s2
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32s3
+            fqbn: esp32:esp32:esp32s3
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32c3
+            fqbn: esp32:esp32:esp32c3
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32c5
+            fqbn: esp32:esp32:esp32c5
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32c6
+            fqbn: esp32:esp32:esp32c6
+            sketch: examples/BasicOTA
           - version: "3.3.0"
             board: esp32h2
+            fqbn: esp32:esp32:esp32h2
+            sketch: examples/CompileCheck
           - version: "3.3.0"
             board: esp32p4
+            fqbn: esp32:esp32:esp32p4
+            sketch: examples/BasicOTA
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile BasicOTA
+      - name: Compile sketch
         uses: arduino/compile-sketches@v1
         with:
-          fqbn: esp32:esp32:${{ matrix.board }}
+          fqbn: ${{ matrix.fqbn }}
           platforms: |
             - name: esp32:esp32
               version: ${{ matrix.version }}
@@ -117,7 +147,7 @@ jobs:
           libraries: |
             - source-path: ./
           sketch-paths: |
-            - examples/CompileCheck
+            - ${{ matrix.sketch }}
 
   verify-rollback-symbol:
     name: verifyRollbackLater comes from the library

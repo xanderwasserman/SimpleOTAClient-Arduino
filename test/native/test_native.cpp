@@ -340,6 +340,10 @@ int main(void) {
           "chip watchdog reset");
     CHECK(strcmp(sotaRollbackReason(SOTA_RST_SW, nullptr), "reset") == 0,
           "software reset with no stored reason");
+    CHECK(strcmp(sotaReportRollbackReason("panic"), "panic") == 0,
+          "the report sends the reason saved when the rollback was detected");
+    CHECK(strcmp(sotaReportRollbackReason(""), "reset") == 0,
+          "a missing saved reason is not taken from a later boot");
 
     printf("===========================\n");
     if (g_failures) {

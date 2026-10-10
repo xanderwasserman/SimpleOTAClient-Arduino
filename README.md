@@ -570,13 +570,13 @@ These flags have to be real compiler defines. A `#define` in the sketch does not
 
 `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG` leaves the bootloader switch in place. It does not start the chip watchdog, so a hang is not reset by this library.
 
-On Arduino IDE 3.x, put the flag in `build_opt.h` next to the sketch, one flag per line:
+With Arduino-ESP32 core 2.0.17 or later, put the flag in `build_opt.h` next to the sketch, in any Arduino IDE version, one flag per line:
 
 ```
 -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK
 ```
 
-Arduino IDE 2.x has no sketch file for this. Pass the flag from arduino-cli or from PlatformIO.
+The same flag can be passed from arduino-cli or from PlatformIO.
 
 ```
 arduino-cli compile --fqbn esp32:esp32:esp32 --build-property compiler.cpp.extra_flags=-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK
@@ -588,7 +588,7 @@ In PlatformIO, add this to `platformio.ini`:
 build_flags = -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK
 ```
 
-Every chip the Arduino-ESP32 core supports has this watchdog behind the same interface. That list is the ESP32, S2, S3, C2, C3, C5, C6, H2, and P4. A target whose build has no `hal/wdt_hal.h` skips the arm. The sketch prints that a hang during the trial is not reset by the library. A crash or a reset still switches back through the bootloader. See [Limitations](#limitations).
+Every chip the Arduino-ESP32 core supports has this watchdog behind the same interface. That list is the ESP32, S2, S3, C2, C3, C5, C6, H2, and P4. A target whose build has no `hal/wdt_hal.h` skips the arm. The library prints that a hang during the trial is not reset by the library. A crash or a reset still switches back through the bootloader. See [Limitations](#limitations).
 
 ### Polling mode
 
@@ -700,7 +700,8 @@ If `Update.begin()` fails at runtime, this is the most likely cause. Verify your
 
 | Limitation | Detail |
 | --- | --- |
-| Hang before `verifyRollbackLater()` | A hang in a global constructor is not covered. The library has not started the chip watchdog yet, so that hang is not reset. The bootloader does not switch back. Crashes and resets after the library's startup hook switch back when this boot is a SimpleOTA trial. Hangs switch back once the chip watchdog has been started. Building with `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG`, or building for a target with no `hal/wdt_hal.h`, leaves hangs unprotected. The sketch prints that. The bootloader still switches back after a crash or a reset unless `-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK` is set. A sketch that uses the chip watchdog itself should start it from `setup()`. A SimpleOTA trial uses that same watchdog until `confirmRunning()`. |
+| Previous partition not saved | If `apply()` cannot save the previous partition, the next boot does not hold the new firmware open. The Arduino core accepts that image. |
+| Hang before `verifyRollbackLater()` | A hang in a global constructor is not covered. The library has not started the chip watchdog yet, so that hang is not reset. The bootloader does not switch back. Crashes and resets after the library's startup hook switch back when this boot is a SimpleOTA trial. Hangs switch back once the chip watchdog has been started. Building with `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG`, or building for a target with no `hal/wdt_hal.h`, leaves hangs unprotected. The library prints that. The bootloader still switches back after a crash or a reset unless `-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK` is set. A sketch that uses the chip watchdog itself should start it from `setup()`. A SimpleOTA trial uses that same watchdog until `confirmRunning()`. |
 | No automatic `reboot` event when `setAutoReboot(false)` | The library only emits `reboot` on the auto-reboot path it controls. Applications that drive their own restart should call `rebootForUpdate()` (which emits the event then calls `esp_restart()`) instead of `ESP.restart()` directly; see AdvancedOTA. |
 | `report()` requires a deployment context | The method needs a `deployment_id`, which only exists after a successful `check()`. The deployment context is retained through `apply()` so post-apply events (e.g. `"reboot"`) work, but `report()` returns `false` before any `check()` has succeeded. |
 | Application owns connectivity | The library is transport-agnostic and does not manage Wi-Fi, Ethernet, PPP, or reconnects. Establish a working IP connection before calling any library method, or supply an `isConnected` probe to `begin()`. |

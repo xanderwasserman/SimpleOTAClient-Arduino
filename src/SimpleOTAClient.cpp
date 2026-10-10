@@ -1409,11 +1409,20 @@ void SimpleOTAClient::processBootValidation() {
                 uint32_t pb = rp.getUInt  (kNvsKeyPrevBuild, 0);
                 String   ph = rp.getString(kNvsKeyPrevHash, "");
                 String   pv = rp.getString(kNvsKeyPrevVer,  "");
+                String   why = rp.getString(kNvsKeyRbWhy, "");
                 // Restore unconditionally: prev build 0 / empty strings are
                 // valid pre-OTA state (fresh device).
                 rp.putUInt  (kNvsKeyBuild,   pb);
                 rp.putString(kNvsKeyHash,    ph);
                 rp.putString(kNvsKeyVersion, pv);
+                // Save the reason on this boot, the one that detected the
+                // rollback. A later boot that only retries the report must
+                // send this value. confirm_timeout was stored before reboot
+                // and is left in place.
+                if (why.isEmpty()) {
+                    rp.putString(kNvsKeyRbWhy,
+                                 sotaRollbackReason((int)esp_reset_reason(), ""));
+                }
                 rp.putUChar(kNvsKeyTrial, 2);
                 rp.end();
             }
@@ -1540,7 +1549,28 @@ void SimpleOTAClient::rollbackExpiredTrial() {
     bool pending = false;
     sota_query_running(&pending, nullptr);
     if (!pending) {
+        // The image is already valid. Drop the trial now. The next boot
+        // would treat the leftover record as confirmed, and this boot
+        // would stay in ROLLING_BACK with confirmRunning() unable to claim.
         SOTA_LOG("rollback skipped; running image is not awaiting acceptance");
+        _inTrial = false;
+        if (_confirmTimer) xTimerStop(_confirmTimer, 0);
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
+        {
+            Preferences p;
+            if (p.begin(kNvsNamespace, /*readOnly=*/true)) {
+                String dep = p.getString(kNvsKeyFailDep, "");
+                uint32_t build = p.getUInt(kNvsKeyFailBuild, 0);
+                p.end();
+                if (!dep.isEmpty() && build != 0) {
+                    _confirmedDep = dep;
+                    _confirmedBuild = build;
+                    _confirmedPending = true;
+                }
+            }
+        }
+        clearTrialState();
+        s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
         return;
     }
 #endif
@@ -1710,7 +1740,9 @@ void SimpleOTAClient::reportRolledBackIfPending() {
         return;
     }
 
-    const char* reason = sotaRollbackReason((int)esp_reset_reason(), storedWhy.c_str());
+    // Saved when the rollback was detected. Do not read this boot's reset
+    // reason: a retry after a later reboot would report that later reset.
+    const char* reason = sotaReportRollbackReason(storedWhy.c_str());
     bool ok = sendStatusFor("rolled_back", reason,
                             failDep.c_str(), failBuild);
     if (ok) {
