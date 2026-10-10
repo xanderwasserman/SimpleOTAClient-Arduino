@@ -550,7 +550,7 @@ If `confirmRunning()` is not called before the confirm time runs out, the librar
 
 During a SimpleOTA trial the library also starts a watchdog that runs on the chip's slow clock. It starts this watchdog from `verifyRollbackLater()`, which runs before `setup()`, and sets it to the confirm time plus a margin of 60 seconds or 10 percent of the confirm time, whichever is larger. While the watchdog runs, a hang before `begin()`, in `setup()`, or in `loop()` resets the chip, and the bootloader then switches back to the previous firmware. This catches hangs that the FreeRTOS timer task cannot interrupt. A hang inside a global constructor happens before `verifyRollbackLater()` runs, so it is not covered.
 
-Every chip the Arduino-ESP32 core supports has this watchdog behind the same interface: the ESP32, S2, S3, C2, C3, C5, C6, H2, and P4. If a target's build has no `hal/wdt_hal.h`, the library does not start the watchdog and prints that a hang during the trial will not be reset. A crash or a reset still switches back through the bootloader. See [Limitations](#limitations).
+With the stock Arduino-ESP32 core this watchdog covers the ESP32, S2, S3, C3, C5, C6, H2, and P4. The stock 3.x core does not build the ESP32-C2. That chip is reachable when Arduino is an ESP-IDF component, and the project must enable app rollback in its own sdkconfig, which ESP-IDF leaves off by default. If a target's build has no `hal/wdt_hal.h`, the library does not start the watchdog and prints that a hang during the trial will not be reset. A crash or a reset still switches back through the bootloader. See [Limitations](#limitations).
 
 At the usual slow clock the chip watchdog can wait at most about 8 hours, or about 13 hours on the ESP32-S2. If you set a longer time with `setConfirmTimeout()`, the software timer still uses the time you asked for, but the chip watchdog fires at its maximum.
 
@@ -578,16 +578,16 @@ Two build flags turn parts of this off. They must be real compiler defines, beca
 
 `-DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG` keeps the bootloader's switch back but does not start the chip watchdog, so this library will not reset a hang during the trial.
 
-With Arduino-ESP32 core 2.0.17 or later, you can put the flag in a `build_opt.h` file next to the sketch, one flag per line. This works in any Arduino IDE version:
+With Arduino-ESP32 core 2.0.17 or later, put the flag in a `build_opt.h` file next to the sketch, one flag per line. This works in any Arduino IDE version. That file is applied when the C watchdog file and the C++ library file are compiled:
 
 ```
 -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK
 ```
 
-You can pass the same flag from arduino-cli:
+From arduino-cli, set the same flag for both compilers. `compiler.cpp.extra_flags` alone does not reach `SimpleOTAWdt.c`:
 
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32 --build-property compiler.cpp.extra_flags=-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK
+arduino-cli compile --fqbn esp32:esp32:esp32 --build-property compiler.c.extra_flags=-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK --build-property compiler.cpp.extra_flags=-DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK
 ```
 
 In PlatformIO, add it to `platformio.ini`:

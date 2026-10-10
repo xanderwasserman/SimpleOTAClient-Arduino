@@ -13,6 +13,10 @@
 # bootloader_dio_30m is shipped, so no FlashFreq board option can compile C2
 # on this core. The latest-core job still compiles every example on the
 # original ESP32.
+#
+# verify-rollback-symbol compiles 2.0.17 S2 and C3 and 3.3.0 ESP32 and C6,
+# then fails unless SimpleOTAWdt.c.o references wdt_hal_init and
+# SimpleOTAClient.cpp.o defines verifyRollbackLater.
 
 name: CI
 
@@ -150,32 +154,58 @@ jobs:
             - ${{ matrix.sketch }}
 
   verify-rollback-symbol:
-    name: verifyRollbackLater comes from the library
+    name: wdt_hal_init (${{ matrix.board }} ${{ matrix.version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2.0.17"
+            board: esp32s2
+            fqbn: esp32:esp32:esp32s2
+          - version: "2.0.17"
+            board: esp32c3
+            fqbn: esp32:esp32:esp32c3
+          - version: "3.3.0"
+            board: esp32
+            fqbn: esp32:esp32:esp32
+          - version: "3.3.0"
+            board: esp32c6
+            fqbn: esp32:esp32:esp32c6
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: arduino/setup-arduino-cli@v2
 
-      - name: Compile and check the strong symbol
+      - name: Compile and require wdt_hal_init
         run: |
           set -euo pipefail
           arduino-cli config init || true
           arduino-cli config add board_manager.additional_urls \
             https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.3.0
-          arduino-cli compile --fqbn esp32:esp32:esp32 \
+          arduino-cli core install esp32:esp32@${{ matrix.version }}
+          arduino-cli compile --fqbn ${{ matrix.fqbn }} \
             --library "$PWD" \
             --build-path "$PWD/build" \
             examples/BasicOTA/BasicOTA.ino
-          obj=$(find build -name 'SimpleOTAClient.cpp.o' | head -1)
-          test -n "$obj"
-          echo "object: $obj"
-          NM=$(find "$HOME/.arduino15/packages/esp32" -type f \( \
-            -name 'xtensa-esp32-elf-nm' -o -name 'xtensa-esp-elf-nm' \) | head -1)
+          wdt=$(find build -name 'SimpleOTAWdt.c.o' | head -1)
+          test -n "$wdt"
+          echo "watchdog object: $wdt"
+          cpp=$(find build -name 'SimpleOTAClient.cpp.o' | head -1)
+          test -n "$cpp"
+          echo "client object: $cpp"
+          NM=""
+          while IFS= read -r candidate; do
+            if "$candidate" "$wdt" >/tmp/sota-wdt-nm.txt 2>/dev/null; then
+              NM="$candidate"
+              break
+            fi
+          done < <(find "$HOME/.arduino15/packages/esp32" -type f -name '*-nm' | sort)
           test -n "$NM"
           echo "nm: $NM"
-          "$NM" "$obj" | tee /tmp/sota-nm.txt
-          grep -E ' T verifyRollbackLater$' /tmp/sota-nm.txt
+          echo "wdt_hal_init reference:"
+          grep -E '(^|[[:space:]])U[[:space:]]+wdt_hal_init$' /tmp/sota-wdt-nm.txt
+          "$NM" "$cpp" | tee /tmp/sota-cpp-nm.txt
+          grep -E ' T verifyRollbackLater$' /tmp/sota-cpp-nm.txt

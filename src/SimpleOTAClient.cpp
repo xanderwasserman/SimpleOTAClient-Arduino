@@ -29,6 +29,11 @@
 #include "SimpleOTASigning.h"
 #include "SimpleOTARollback.h"
 
+// The CONFIG_* checks below have to see sdkconfig.h themselves. Do not rely
+// on HTTPClient.h or another header to include it. SimpleOTAWdt.c includes
+// the same header before its own gate.
+#include "sdkconfig.h"
+
 // Bootloader pending-verify is compiled into stock Arduino-ESP32 2.x and 3.x
 // (CONFIG_APP_ROLLBACK_ENABLE, from CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE).
 // A sketch #define does not reach this translation unit; the opt-out is a
@@ -46,9 +51,13 @@
 
 // The chip watchdog lives in SimpleOTAWdt.c. That file is C because
 // hal/wdt_hal.h does not compile as C++ on the S2 and the C3 in core 2.0.17.
-// Every chip the core supports uses wdt_hal WDT_RWDT: RTC_WDT on
-// ESP32/S2/S3/C2/C3 and LP_WDT on C5/C6/H2/P4. A target with no hal/wdt_hal.h
-// skips the arm. A crash or a reset still rolls back. A hang does not.
+// Stock cores build it for the ESP32, S2, S3, C3, C5, C6, H2, and P4, through
+// wdt_hal WDT_RWDT: RTC_WDT on ESP32/S2/S3/C3 and LP_WDT on C5/C6/H2/P4.
+// The stock 3.x core does not build the ESP32-C2. That chip is reachable
+// when Arduino is an ESP-IDF component, and the project must enable app
+// rollback in its own sdkconfig, which ESP-IDF leaves off by default.
+// A target with no hal/wdt_hal.h skips the arm. A crash or a reset still
+// rolls back. A hang does not.
 
 #if SOTA_BOOTLOADER_ROLLBACK
 #include "nvs.h"
@@ -145,6 +154,25 @@ static bool sota_read_trial(uint8_t* trial, uint32_t* prevPart) {
     return true;
 }
 
+// On the boot that finds itself back on the previous partition, store the
+// reset reason before setup(). The key matches kNvsKeyRbWhy. A value already
+// stored, including confirm_timeout, is left alone. Never erase NVS here.
+static void sota_save_detected_rollback_reason(void) {
+    if (nvs_flash_init() != ESP_OK) return;
+    nvs_handle_t handle;
+    if (nvs_open("simpleota", NVS_READWRITE, &handle) != ESP_OK) return;
+    char existing[32];
+    size_t len = sizeof(existing);
+    esp_err_t err = nvs_get_str(handle, "sota_rb_why", existing, &len);
+    bool missing = (err == ESP_ERR_NVS_NOT_FOUND) ||
+                   (err == ESP_OK && existing[0] == '\0');
+    if (missing) {
+        const char* why = sotaRollbackReason((int)esp_reset_reason(), "");
+        if (nvs_set_str(handle, "sota_rb_why", why) == ESP_OK) nvs_commit(handle);
+    }
+    nvs_close(handle);
+}
+
 // Strong override of the weak symbol in esp32-hal-misc.c. C linkage, because
 // the core declares it from a .c file. This definition stays in this file so
 // a PlatformIO archived library still pulls the strong symbol in with the
@@ -164,6 +192,9 @@ extern "C" bool verifyRollbackLater() {
     bool runningMatches = (prevPart != 0 && addr == prevPart);
     bool hold = sotaHoldPendingImage(pending, nvsOpen, trial, prevPart, runningMatches);
     if (!hold) {
+        if (nvsOpen && trial == 1 && runningMatches) {
+            sota_save_detected_rollback_reason();
+        }
         s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
         sota_wdt_quiesce();
         return false;
@@ -1415,10 +1446,10 @@ void SimpleOTAClient::processBootValidation() {
                 rp.putUInt  (kNvsKeyBuild,   pb);
                 rp.putString(kNvsKeyHash,    ph);
                 rp.putString(kNvsKeyVersion, pv);
-                // Save the reason on this boot, the one that detected the
-                // rollback. A later boot that only retries the report must
-                // send this value. confirm_timeout was stored before reboot
-                // and is left in place.
+                // verifyRollbackLater() stores this on the detecting boot, before
+                // setup(). Fill it here if that write did not happen.
+                // confirm_timeout was stored before reboot and is left in place.
+                // A later boot that only retries the report sends this value.
                 if (why.isEmpty()) {
                     rp.putString(kNvsKeyRbWhy,
                                  sotaRollbackReason((int)esp_reset_reason(), ""));

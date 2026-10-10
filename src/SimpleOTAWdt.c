@@ -5,6 +5,7 @@
  * the C++ file used to make.
  */
 
+#include "sdkconfig.h"
 #include "SimpleOTARollback.h"
 
 #include <stdbool.h>
@@ -31,6 +32,14 @@
 
 #ifndef SOTA_WDT_C
 #define SOTA_WDT_C 0
+#endif
+
+#if (defined(CONFIG_APP_ROLLBACK_ENABLE) || defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)) \
+    && !defined(SIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK) \
+    && !defined(SIMPLEOTA_DISABLE_TRIAL_WATCHDOG) \
+    && __has_include("hal/wdt_hal.h") \
+    && !SOTA_WDT_C
+#error "SimpleOTA trial watchdog was left out of this build"
 #endif
 
 static bool s_armed = false;
