@@ -44,31 +44,11 @@
 #warning "CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP is not set. A deep-sleep wake during a SimpleOTA trial can roll the image back. Call confirmRunning() before esp_deep_sleep_start()."
 #endif
 
-// Every chip the Arduino-ESP32 core supports exposes this watchdog through
-// wdt_hal as WDT_RWDT: RTC_WDT on ESP32/S2/S3/C2/C3 (RWDT_DEV_GET is
-// &RTCCNTL) and LP_WDT on C5/C6/H2/P4 (rwdt_ll.h aliases LP_WDT). A target
-// whose HAL header is absent skips the arm; the bootloader path still
-// rolls back a crash or reset, and a hang is not reset by this library.
-#if SOTA_BOOTLOADER_ROLLBACK && __has_include("hal/wdt_hal.h")
-#define SOTA_WDT_HAL 1
-#include "hal/wdt_hal.h"
-#include "soc/rtc.h"
-#if __has_include("esp_private/esp_clk.h")
-#include "esp_private/esp_clk.h"
-#define SOTA_HAVE_SLOWCLK_CAL 1
-#else
-#define SOTA_HAVE_SLOWCLK_CAL 0
-#endif
-#else
-#define SOTA_WDT_HAL 0
-#define SOTA_HAVE_SLOWCLK_CAL 0
-#endif
-
-#if SOTA_WDT_HAL && !defined(SIMPLEOTA_DISABLE_TRIAL_WATCHDOG)
-#define SOTA_TRIAL_WDT 1
-#else
-#define SOTA_TRIAL_WDT 0
-#endif
+// The chip watchdog lives in SimpleOTAWdt.c. That file is C because
+// hal/wdt_hal.h does not compile as C++ on the S2 and the C3 in core 2.0.17.
+// Every chip the core supports uses wdt_hal WDT_RWDT: RTC_WDT on
+// ESP32/S2/S3/C2/C3 and LP_WDT on C5/C6/H2/P4. A target with no hal/wdt_hal.h
+// skips the arm. A crash or a reset still rolls back. A hang does not.
 
 #if SOTA_BOOTLOADER_ROLLBACK
 #include "nvs.h"
@@ -98,7 +78,6 @@ bool SimpleOTAClient::_debugEnabled = false;
 // Bootloader pending-verify and the RTC/LP trial watchdog
 // ---------------------------------------------------------------------------
 
-static bool s_trialWdtArmed = false;
 static std::atomic<uint8_t> s_trialPhase((uint8_t)SOTA_PHASE_IDLE);
 
 static bool sota_claim(int claim) {
@@ -127,59 +106,6 @@ static bool sota_query_running(bool* pending, uint32_t* address) {
 #endif
     return true;
 }
-
-#if SOTA_WDT_HAL
-#if SOTA_TRIAL_WDT
-static uint32_t sota_wdt_ticks(uint32_t confirmSec) {
-    uint32_t margin = sotaWatchMarginSec(confirmSec, SIMPLEOTA_TRIAL_WDT_MARGIN_S);
-    uint64_t totalSec = (uint64_t)confirmSec + (uint64_t)margin;
-    uint64_t us = totalSec * 1000000ull;
-#if SOTA_HAVE_SLOWCLK_CAL
-    uint32_t cal = esp_clk_slowclk_cal_get();
-    uint64_t calibrated = sotaSlowclkTicks(us, cal);
-    if (calibrated != 0) {
-        if (calibrated > 0xFFFFFFFFu) return 0xFFFFFFFFu;
-        if (calibrated < 2) return 2;
-        return (uint32_t)calibrated;
-    }
-#else
-    (void)us;
-#endif
-    return sotaNominalSlowTicks(totalSec, rtc_clk_slow_freq_get_hz());
-}
-#endif
-
-static void sota_disarm_trial_wdt() {
-    wdt_hal_context_t hal;
-    wdt_hal_init(&hal, WDT_RWDT, 0, false);
-    wdt_hal_write_protect_disable(&hal);
-    wdt_hal_set_flashboot_en(&hal, false);
-    wdt_hal_disable(&hal);
-    wdt_hal_write_protect_enable(&hal);
-    s_trialWdtArmed = false;
-}
-
-static void sota_arm_trial_wdt(uint32_t confirmSec) {
-#if !SOTA_TRIAL_WDT
-    (void)confirmSec;
-    s_trialWdtArmed = false;
-#else
-    wdt_hal_context_t hal;
-    wdt_hal_init(&hal, WDT_RWDT, 0, false);
-    wdt_hal_write_protect_disable(&hal);
-    wdt_hal_config_stage(&hal, WDT_STAGE0,
-                         sota_wdt_ticks(confirmSec),
-                         WDT_STAGE_ACTION_RESET_RTC);
-    wdt_hal_set_flashboot_en(&hal, false);
-    wdt_hal_enable(&hal);
-    wdt_hal_write_protect_enable(&hal);
-    s_trialWdtArmed = true;
-#endif
-}
-#else
-static void sota_disarm_trial_wdt() { s_trialWdtArmed = false; }
-static void sota_arm_trial_wdt(uint32_t) { s_trialWdtArmed = false; }
-#endif
 
 static void sota_mark_running_valid() {
 #if SOTA_BOOTLOADER_ROLLBACK
@@ -239,17 +165,11 @@ extern "C" bool verifyRollbackLater() {
     bool hold = sotaHoldPendingImage(pending, nvsOpen, trial, prevPart, runningMatches);
     if (!hold) {
         s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
-#if SOTA_WDT_HAL
-        sota_disarm_trial_wdt();
-#endif
+        sota_wdt_quiesce();
         return false;
     }
     s_trialPhase.store((uint8_t)SOTA_PHASE_TRIAL, std::memory_order_release);
-#if SOTA_TRIAL_WDT
-    sota_arm_trial_wdt(SIMPLEOTA_CONFIRM_TIMEOUT_S);
-#elif SOTA_WDT_HAL
-    sota_disarm_trial_wdt();
-#endif
+    sota_wdt_arm(SIMPLEOTA_CONFIRM_TIMEOUT_S);
     return true;
 }
 #endif
@@ -631,10 +551,10 @@ void SimpleOTAClient::setConfirmTimeout(uint32_t seconds) {
             0);
     }
     if (s_trialPhase.load(std::memory_order_acquire) == SOTA_PHASE_TRIAL) {
-        sota_arm_trial_wdt(_confirmTimeoutSec);
+        sota_wdt_arm(_confirmTimeoutSec);
     }
     if (!sotaTimeoutRearmAllowed(s_trialPhase.load(std::memory_order_acquire))) {
-        if (s_trialWdtArmed) sota_disarm_trial_wdt();
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
         if (_confirmTimer) xTimerStop(_confirmTimer, 0);
     }
 }
@@ -1454,7 +1374,7 @@ void SimpleOTAClient::processBootValidation() {
         // Only stop a watchdog this library started. A watchdog the sketch
         // armed in setup(), before begin(), is left running.
         sota_mark_running_valid();
-        if (s_trialWdtArmed) sota_disarm_trial_wdt();
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
         SOTA_LOG("bootval: pending image accepted (not a held SimpleOTA trial)");
     }
 
@@ -1479,7 +1399,7 @@ void SimpleOTAClient::processBootValidation() {
         prevPart, runningMatchesPrev, haveRunning);
 
     if (action == SOTA_TRIAL_ROLLED_BACK) {
-        if (s_trialWdtArmed) sota_disarm_trial_wdt();
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
         s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
         if (trial == 1 && runningMatchesPrev) {
             // The bootloader switched back before this image was accepted.
@@ -1505,7 +1425,7 @@ void SimpleOTAClient::processBootValidation() {
     }
 
     if (action == SOTA_TRIAL_ACCEPT_RESIDUAL) {
-        if (s_trialWdtArmed) sota_disarm_trial_wdt();
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
         s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
         if (confirmPend && !pendDep.isEmpty() && pendBuild) {
             _confirmedDep     = pendDep;
@@ -1521,7 +1441,7 @@ void SimpleOTAClient::processBootValidation() {
 
     if (action == SOTA_TRIAL_CLEAR) {
         SOTA_LOG("bootval: trial snapshot incomplete; clearing");
-        if (s_trialWdtArmed) sota_disarm_trial_wdt();
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
         s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
         clearTrialState();
         Preferences pf;
@@ -1538,7 +1458,7 @@ void SimpleOTAClient::processBootValidation() {
         // The image is already valid. Do not arm the timer or the watchdog,
         // and do not roll it back. The leftover trial record is a confirm
         // that lost power before the record was cleared.
-        if (s_trialWdtArmed) sota_disarm_trial_wdt();
+        if (sota_wdt_is_armed()) sota_wdt_disarm();
         s_trialPhase.store((uint8_t)SOTA_PHASE_IDLE, std::memory_order_release);
         if (!pendDep.isEmpty() && pendBuild != 0) {
             _confirmedDep     = pendDep;
@@ -1559,12 +1479,11 @@ void SimpleOTAClient::processBootValidation() {
     // window that actually applies.
     s_trialPhase.store((uint8_t)SOTA_PHASE_TRIAL, std::memory_order_release);
     _inTrial = true;
-#if SOTA_TRIAL_WDT
-    sota_arm_trial_wdt(_confirmTimeoutSec);
-#else
-    Serial.println(F("[SimpleOTAClient] the chip watchdog is not started on this "
-                     "build; a hang during the trial is not reset by the library."));
-#endif
+    sota_wdt_arm(_confirmTimeoutSec);
+    if (!sota_wdt_is_armed()) {
+        Serial.println(F("[SimpleOTAClient] the chip watchdog is not started on this "
+                         "build; a hang during the trial is not reset by the library."));
+    }
     const TickType_t period = (TickType_t)sotaConfirmTimerTicks(
         _confirmTimeoutSec, (uint32_t)configTICK_RATE_HZ);
     _confirmTimer = xTimerCreate("sota_confirm",
@@ -1743,7 +1662,7 @@ bool SimpleOTAClient::confirmRunning() {
     // cleared is recovered on the next boot. processBootValidation() sees
     // the trial record on an image that is already valid, queues the
     // confirmed report, and does not arm the timer or the watchdog.
-    sota_disarm_trial_wdt();
+    sota_wdt_disarm();
     sota_mark_running_valid();
     // Capture the confirm context from NVS BEFORE clearTrialState() wipes
     // it, so reportConfirmedIfPending() can POST a "confirmed" event for

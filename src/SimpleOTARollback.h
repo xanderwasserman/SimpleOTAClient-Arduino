@@ -70,14 +70,14 @@ static inline bool sotaShouldMarkImageValid(
  * SOTA_TRIAL_ACCEPT_RESIDUAL Rollback was turned off. Accept the image and
  *                            drop the leftover trial record.
  */
-enum SotaTrialBoot {
+typedef enum SotaTrialBoot {
     SOTA_TRIAL_NONE = 0,
     SOTA_TRIAL_HOLD,
     SOTA_TRIAL_CONFIRMED,
     SOTA_TRIAL_ROLLED_BACK,
     SOTA_TRIAL_CLEAR,
     SOTA_TRIAL_ACCEPT_RESIDUAL,
-};
+} SotaTrialBoot;
 
 static inline SotaTrialBoot sotaTrialBootAction(
     bool bootloaderRollbackCompiled,
@@ -106,17 +106,17 @@ static inline SotaTrialBoot sotaTrialBootAction(
  * setConfirmTimeout() all read it. Only TRIAL can move, and only to
  * CONFIRMING or ROLLING_BACK, so the two writes cannot both proceed.
  */
-enum SotaTrialPhase {
+typedef enum SotaTrialPhase {
     SOTA_PHASE_IDLE = 0,
     SOTA_PHASE_TRIAL = 1,
     SOTA_PHASE_CONFIRMING = 2,
     SOTA_PHASE_ROLLING_BACK = 3,
-};
+} SotaTrialPhase;
 
-enum SotaPhaseClaim {
+typedef enum SotaPhaseClaim {
     SOTA_CLAIM_CONFIRM = 0,
     SOTA_CLAIM_ROLLBACK = 1,
-};
+} SotaPhaseClaim;
 
 static inline bool sotaClaimPhase(uint8_t phase, int claim, uint8_t* next)
 {
@@ -215,5 +215,21 @@ static inline const char* sotaRollbackReason(int resetCode, const char* stored)
         default:                 return "reset";
     }
 }
+
+/*
+ * The chip watchdog is armed from SimpleOTAWdt.c, which is C. On Arduino
+ * core 2.0.17 the S2 and C3 mwdt_ll.h header does not compile as C++.
+ * verifyRollbackLater() stays in SimpleOTAClient.cpp.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void sota_wdt_arm(uint32_t confirm_sec);
+void sota_wdt_disarm(void);
+void sota_wdt_quiesce(void);
+bool sota_wdt_is_armed(void);
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // SIMPLEOTA_ROLLBACK_H
