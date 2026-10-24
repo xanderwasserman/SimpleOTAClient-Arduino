@@ -1,30 +1,26 @@
-// BasicOTA: minimal SimpleOTAClient integration example.
+// BasicOTA: the smallest polling integration.
 //
-// Wires up Wi-Fi, then polls SimpleOTAClient once an hour. The library does NOT
-// manage Wi-Fi or scheduling; that is the application's responsibility.
+// Brings up Wi-Fi, then once an hour confirms a running trial, checks for an
+// update and applies it. The library does not manage Wi-Fi or scheduling;
+// the sketch does.
 //
-// IMPORTANT: do NOT pass your own firmware version counter as the build
-// number. SimpleOTAClient assigns its own monotonic build number on upload, and
-// the library persists it to NVS for you. See README.md for details.
+// SimpleOTA assigns each build you upload its build number, and the library
+// keeps the running one in NVS: never pass your own version counter as the
+// build. A sketch flashed over USB reports build 0, so the server offers it
+// its current release. See README.md.
 
 #include <WiFi.h>
-#include <SimpleOTAClient.h>
+#include <esp_log.h>
+#include <simpleota.h>
 
 static const char* WIFI_SSID = "your-ssid";
 static const char* WIFI_PASS = "your-password";
 
 static const char* SOTA_TOKEN = "soto_proj_xxxx";   // project or device token
 
-// The version label of this firmware image. Used by SimpleOTAClient to report
-// the currently-running firmware to the dashboard (version_label field).
-// Bump this string whenever you build and upload a new release to SimpleOTA.
-// After an OTA the library automatically persists the incoming version to NVS,
-// so subsequent boots self-report correctly even without rebuilding; but
-// declaring it here makes the firmware itself the authoritative source.
+// The version label of this image, shown on the dashboard. Bump it with each
+// build you upload to SimpleOTA.
 #define FIRMWARE_VERSION "1.0.0"
-
-// Device ID auto-derived from the Wi-Fi MAC address. No setup needed.
-SimpleOTAClient ota(SOTA_TOKEN, SimpleOTAClient::CHIP_ESP32);
 
 static void connectWiFi() {
     WiFi.mode(WIFI_STA);
@@ -40,17 +36,18 @@ static void connectWiFi() {
 void setup() {
     Serial.begin(115200);
     Serial.println(FIRMWARE_VERSION);
-    delay(200);
-    SimpleOTAClient::setDebug(true);   // verbose [SimpleOTAClient] logs on Serial
     connectWiFi();
 
-    // Report this firmware's version label to the dashboard. After the first
-    // OTA the library persists the incoming version to NVS; this call ensures
-    // the factory-installed image is also visible from boot zero.
-    ota.setVersionLabel(FIRMWARE_VERSION);
-
-    // TLS is verified by default against the bundled ISRG Root X1 root CA.
-    // Call ota.setCACert(nullptr) to disable verification (development only).
+    // TLS is always verified, by default against the ISRG roots that
+    // SimpleOTA's hosts use. For a local server, also set cfg.base_url and
+    // cfg.cert_pem to your own CA.
+    simpleota_config_t cfg = {};
+    cfg.token = SOTA_TOKEN;
+    cfg.version_label = FIRMWARE_VERSION;
+    if (simpleota_init(&cfg) != ESP_OK) {
+        Serial.println("[app] SimpleOTA did not start; see the log above");
+    }
+    esp_log_level_set("simpleota", ESP_LOG_INFO);   // log every check
 }
 
 void loop() {
@@ -58,20 +55,16 @@ void loop() {
         connectWiFi();
     }
 
-    // Rollback support: if the previous OTA armed a trial install, this call
-    // confirms the new image is healthy. Place it where you are confident the
-    // application is working (after sensors initialized, first message
-    // exchanged with your service, etc.). Polling-mode users MUST call this
-    // explicitly or every OTA will roll back after SIMPLEOTA_CONFIRM_TIMEOUT_S
-    // (default 300s). It is a no-op when no trial is in progress.
-    ota.confirmRunning();
+    // A new image runs as a trial, and rolls back unless it is confirmed
+    // within the confirm timeout (300 s by default). Confirm where you know
+    // the sketch works: here, Wi-Fi is up. Without a trial this does nothing.
+    simpleota_confirm();
 
-    if (ota.check()) {
-        OTAResult r = ota.apply();   // reboots on success by default
-        if (r != OTA_SUCCESS) {
-            Serial.println("[app] OTA failed, continuing");
-        }
+    bool update = false;
+    if (simpleota_check(&update) == ESP_OK && update) {
+        simpleota_result_t r = simpleota_apply();   // restarts on success
+        Serial.printf("[app] update not installed (result %d)\n", (int)r);
     }
 
-    delay((uint32_t)SIMPLEOTA_CHECK_INTERVAL_S * 1000UL);
+    delay(3600UL * 1000UL);   // check again in an hour
 }

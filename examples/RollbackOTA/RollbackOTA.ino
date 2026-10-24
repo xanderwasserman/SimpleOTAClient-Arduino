@@ -1,22 +1,20 @@
-// RollbackOTA: managed-mode with an APPLICATION-defined health gate.
+// RollbackOTA: managed updates, confirmed by the sketch's own health check.
 //
-// This sketch shows how to override the default managed-mode auto-confirm
-// (which fires on the first successful /check/ response) so the trial only completes
-// after your own application-level health check passes. If the health check
-// does not pass within SIMPLEOTA_CONFIRM_TIMEOUT_S (or your override), the
-// library reboots into the previous firmware partition.
+// By default the managed task confirms a new image on its first successful
+// check-in. Here the sketch confirms it instead, once its own health check
+// passes. If that does not happen within the confirm timeout, the device
+// goes back to the previous image.
 //
-// Typical reasons to use this pattern:
-//   - Your firmware does more than talk to SimpleOTA (sensors, actuators,
-//     auxiliary servers) and you want all of those proven before confirming.
-//   - You ship to flaky transports (cellular) where the OTA check is the
-//     easiest part of bring-up.
+// Use this when:
+//   - your firmware does more than talk to SimpleOTA (sensors, actuators,
+//     other servers) and all of it should work before an update is kept;
+//   - the update check is the easiest part of bring-up, as on cellular.
 //
-// IMPORTANT: confirmRunning() MUST be called before the timeout expires, or
-// the device will roll back. Don't gate it on something that may never happen.
+// Confirm before the timeout, and don't gate the confirm on something that
+// may never happen: an unconfirmed image always rolls back.
 
 #include <WiFi.h>
-#include <SimpleOTAClient.h>
+#include <simpleota.h>
 
 static const char* WIFI_SSID = "your-ssid";
 static const char* WIFI_PASS = "your-password";
@@ -25,56 +23,44 @@ static const char* SOTA_TOKEN = "soto_proj_xxxx";
 
 #define FIRMWARE_VERSION "1.0.0"
 
-SimpleOTAClient ota(SOTA_TOKEN, SimpleOTAClient::CHIP_ESP32);
+static bool wifiUp(void*) { return WiFi.status() == WL_CONNECTED; }
 
-static bool wifiUp() { return WiFi.status() == WL_CONNECTED; }
-
-// Pretend health probe. Replace with your actual check (MQTT round-trip,
-// sensor read sanity, etc.). Returns true once everything looks healthy.
+// Stand-in for your health check (an MQTT round trip, a sane sensor
+// reading, ...). True once everything looks healthy.
 static bool applicationHealthy() {
-    // ... your own logic ...
     return WiFi.status() == WL_CONNECTED;
 }
-
-static bool confirmed = false;
 
 void setup() {
     Serial.begin(115200);
     Serial.println(FIRMWARE_VERSION);
-    delay(200);
-    SimpleOTAClient::setDebug(true);
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-    ota.setVersionLabel(FIRMWARE_VERSION);
-
-    // Disable managed auto-confirm so the library waits for our explicit
-    // confirmRunning() call instead of confirming on the first successful /check/.
-    ota.setManagedAutoConfirm(false);
-
-    // Give the application 120 seconds to call confirmRunning() after a
-    // trial boot. Tune to the worst-case boot-to-healthy time of your
-    // firmware (include OS init, transport bring-up, server handshake).
-    // The default is 300 seconds; on cellular consider raising it further.
-    ota.setConfirmTimeout(120);
-
-    ota.begin(/*checkIntervalSec*/ 3600,
-              /*onResult*/         nullptr,
-              /*isConnected*/      wifiUp);
+    simpleota_config_t cfg = {};
+    cfg.token = SOTA_TOKEN;
+    cfg.version_label = FIRMWARE_VERSION;
+    cfg.check_interval_s = 3600;
+    cfg.is_connected = wifiUp;
+    // The sketch confirms, not the first check-in.
+    cfg.manual_confirm = true;
+    // Seconds from boot to confirm. Cover your worst-case boot-to-healthy
+    // time (start-up, connecting, the first server round trip). The
+    // default is 300; on cellular consider more.
+    cfg.confirm_timeout_s = 120;
+    if (simpleota_init(&cfg) != ESP_OK || simpleota_start() != ESP_OK) {
+        Serial.println("[app] SimpleOTA did not start; see the log above");
+    }
 }
 
 void loop() {
-    // Run the application's health gate until the trial is confirmed. confirmRunning()
-    // is a no-op when no trial is in progress, so calling it on a normal boot
-    // is harmless. ota.isTrialInstall() lets you skip the work entirely when
-    // there's nothing to confirm.
-    if (!confirmed && ota.isTrialInstall() && applicationHealthy()) {
-        // confirmRunning() returns false if the bootloader could not record
-        // the image as good. The trial carries on, so try again next time.
-        if (ota.confirmRunning()) {
+    // While this image is on trial, confirm it once the health check passes.
+    if (simpleota_is_trial_boot() && applicationHealthy()) {
+        // ESP_FAIL when the bootloader could not record the image as good:
+        // the trial goes on, so this runs again on the next loop.
+        if (simpleota_confirm() == ESP_OK) {
             Serial.println("[app] trial confirmed");
-            confirmed = true;
         }
     }
 

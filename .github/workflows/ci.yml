@@ -22,40 +22,25 @@ jobs:
           library-manager: update
           compliance: strict
 
-  native-test:
-    name: Host unit tests
+  core-sync:
+    name: Vendored core matches its commit
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and run signing tests
-        run: |
-          cc  -std=c99   -Wall -Wextra -Isrc -c src/monocypher.c src/monocypher-ed25519.c
-          g++ -std=c++11 -Wall -Wextra -Isrc -o test_signing \
-              test/native/test_signing.cpp src/SimpleOTASigning.cpp \
-              monocypher.o monocypher-ed25519.o
-          ./test_signing
+      - name: Read the core commit
+        id: core
+        run: echo "sha=$(cat src/sota_core/CORE_VERSION)" >> "$GITHUB_OUTPUT"
 
-      - name: Build and run tick conversion tests
-        run: |
-          g++ -std=c++11 -Wall -Wextra -Werror -Isrc -o test_time test/native/test_time.cpp
-          ./test_time
+      - uses: actions/checkout@v4
+        with:
+          repository: wassie-dev/simpleOTAClient-core
+          ref: ${{ steps.core.outputs.sha }}
+          path: core
 
-      - name: Build and run trial record and outbox tests
-        run: |
-          g++ -std=c++11 -Wall -Wextra -Werror -Isrc -o test_trial test/native/test_trial.cpp
-          ./test_trial
-
-      - name: Build and run watchdog tests
-        run: |
-          g++ -std=c++11 -Wall -Wextra -Werror -Isrc -o test_watchdog test/native/test_watchdog.cpp
-          ./test_watchdog
-
-      - name: Build and run server URL tests
-        run: |
-          g++ -std=c++11 -Wall -Wextra -Werror -Isrc -o test_url test/native/test_url.cpp
-          ./test_url
+      - name: Compare
+        run: core/scripts/sync-core.sh --check src/sota_core src
 
   compile:
     name: Compile examples (ESP32)
@@ -111,11 +96,11 @@ jobs:
             --build-property "compiler.c.extra_flags=${{ matrix.flags }}" \
             examples/BasicOTA
           nm_bin=$(find "$HOME/.arduino15/packages/esp32/tools" -name 'xtensa-esp*-elf-nm' | head -1)
-          hook=$("$nm_bin" build/libraries/*/SimpleOTAClient.cpp.o | grep -c ' T verifyRollbackLater$' || true)
-          wdt=$("$nm_bin" build/libraries/*/SimpleOTAWdt.c.o | grep -cE ' U wdt_hal_init$' || true)
+          hook=$("$nm_bin" build/libraries/*/sota_core/sota_framework.c.o | grep -c ' T verifyRollbackLater$' || true)
+          wdt=$("$nm_bin" build/libraries/*/sota_core/sota_wdt_esp32.c.o | grep -cE ' U wdt_hal_init$' || true)
           case "${{ matrix.flags }}" in
             "")                                    want_hook=1; want_wdt=1 ;;
-            -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK) want_hook=0; want_wdt=0 ;;
+            -DSIMPLEOTA_DISABLE_BOOTLOADER_ROLLBACK) want_hook=0; want_wdt=1 ;;
             -DSIMPLEOTA_DISABLE_TRIAL_WATCHDOG)    want_hook=1; want_wdt=0 ;;
           esac
           echo "verifyRollbackLater: $hook (want $want_hook); wdt_hal_init: $wdt (want $want_wdt)"

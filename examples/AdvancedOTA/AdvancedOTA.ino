@@ -1,21 +1,23 @@
-// AdvancedOTA: full manual control of the SimpleOTAClient lifecycle.
+// AdvancedOTA: polling mode with every option the device can report.
 //
 // Demonstrates:
-//   - Custom deviceId (e.g. a serial number stored in your own flash region).
-//   - boardId and hardwareRevision metadata, used by the server to target
-//     deployments at specific hardware variants.
-//   - setPartitionProfile(): tells the server which partition layout this
-//     device uses so it only receives compatible firmware builds.
-//   - setNvsSchemaVersion(): incremented when your own NVS layout changes.
-//   - setLabels(): arbitrary key/value metadata for server-side targeting.
-//   - setSecurityMode(): advertises TLS capability to the server.
-//   - setAutoReboot(false): the application decides when to restart, and
-//     uses rebootForUpdate() to emit the "reboot" event before restarting.
-//   - lastOfferedVersion(): read the version label from the check() offer.
-//   - Verbose logging via SimpleOTAClient::setDebug(true).
+//   - device_id: your own stable per-unit identifier.
+//   - board_id and hardware_revision, which the server can target
+//     deployments at.
+//   - partition_profile: the partition layout, so the device only gets
+//     builds that fit it.
+//   - nvs_schema_version: raised when your own NVS layout changes.
+//   - labels_json: key/value metadata for server-side targeting.
+//   - security_mode and channel.
+//   - disable_auto_reboot: the sketch decides when to restart, and calls
+//     simpleota_reboot_for_update() so the server sees the "reboot" event.
+//   - simpleota_last_offered_version(): the version label of the offer.
+//   - event_cb: download progress, failure reasons and trial outcomes.
+//   - Verbose logs with esp_log_level_set().
 
 #include <WiFi.h>
-#include <SimpleOTAClient.h>
+#include <esp_log.h>
+#include <simpleota.h>
 
 #define FIRMWARE_VERSION "1.0.0"
 
@@ -23,20 +25,6 @@ static const char* WIFI_SSID = "your-ssid";
 static const char* WIFI_PASS = "your-password";
 
 static const char* SOTA_TOKEN = "soto_proj_xxxx";   // project or device token
-
-// Stable per-unit identifier. Real applications might read this from a
-// factory-provisioned NVS namespace, an EEPROM, or a serial number sticker
-// captured at manufacturing time. The buffer must outlive the SimpleOTAClient
-// instance; a static / global is the simplest pattern.
-static const char* DEVICE_ID        = "sn-000123";
-static const char* BOARD_ID         = "acme-widget-v2";
-static const char* HARDWARE_REV     = "C";
-
-SimpleOTAClient ota(SOTA_TOKEN,
-                    SimpleOTAClient::CHIP_ESP32,
-                    DEVICE_ID,
-                    BOARD_ID,
-                    HARDWARE_REV);
 
 static void connectWiFi() {
     WiFi.mode(WIFI_STA);
@@ -49,97 +37,113 @@ static void connectWiFi() {
     Serial.printf("\n[app] Wi-Fi up: %s\n", WiFi.localIP().toString().c_str());
 }
 
+// Runs on the task that drives the update; keep it short.
+static void onOtaEvent(const simpleota_event_t* e, void*) {
+    switch (e->id) {
+    case SIMPLEOTA_EVENT_DOWNLOAD_PROGRESS:
+        Serial.printf("[app] downloaded %u of %u bytes\n", (unsigned)e->bytes_done,
+                      (unsigned)e->bytes_total);
+        break;
+    case SIMPLEOTA_EVENT_UPDATE_FAILED:
+        Serial.printf("[app] update %u failed: %s\n", (unsigned)e->build_number,
+                      e->reason ? e->reason : "?");
+        break;
+    case SIMPLEOTA_EVENT_ROLLING_BACK:
+        Serial.printf("[app] trial failed (%s), rolling back\n", e->reason ? e->reason : "?");
+        break;
+    default:
+        break;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println(FIRMWARE_VERSION);
-    delay(200);
-    SimpleOTAClient::setDebug(true);   // verbose [SimpleOTAClient] logs on Serial
+
+    simpleota_config_t cfg = {};
+    cfg.token = SOTA_TOKEN;
+    // A stable per-unit identifier, such as a serial number provisioned at
+    // the factory. The default is the Wi-Fi MAC address.
+    cfg.device_id = "sn-000123";
+    cfg.board_id = "acme-widget-v2";
+    cfg.hardware_revision = "C";
+    // Match the scheme under Tools > Partition Scheme.
+    cfg.partition_profile = "default_4mb";
+    // 1 unless you restructure your own NVS namespaces and want the server
+    // to gate builds on it.
+    cfg.nvs_schema_version = 1;
+    // Must be one JSON object; anything else is left out, with a warning.
+    cfg.labels_json = "{\"site\":\"factory-A\",\"line\":\"3\"}";
+    // The security mode the server matches builds on.
+    cfg.security_mode = SIMPLEOTA_SECURITY_BASIC;
+    // Applied by the server on first registration, or when the device has
+    // no channel yet.
+    cfg.channel = "stable";
+    // Shown on the dashboard under Reported firmware state > Version label.
+    cfg.version_label = FIRMWARE_VERSION;
+    // Take control of the reboot.
+    cfg.disable_auto_reboot = true;
+    cfg.event_cb = onOtaEvent;
+    if (simpleota_init(&cfg) != ESP_OK) {
+        Serial.println("[app] SimpleOTA did not start; see the log above");
+        return;
+    }
+    esp_log_level_set("simpleota", ESP_LOG_DEBUG);   // every step, on Serial
+
     connectWiFi();
 
-    // Confirm a prior trial install (no-op if not in trial). Call this as
-    // early as your application can prove it is healthy. Here we do it
-    // right after Wi-Fi succeeds; production firmware would gate it on
-    // an end-to-end health probe (e.g., MQTT round-trip).
-    ota.confirmRunning();
+    // Confirm a trial (nothing happens without one) as early as the sketch
+    // can prove it is healthy. Here that is right after Wi-Fi; production
+    // firmware would wait for an end-to-end check, such as an MQTT round
+    // trip.
+    simpleota_confirm();
 
-    // Tell the server which partition layout this device uses.
-    // Match the scheme you selected under Tools -> Partition Scheme.
-    ota.setPartitionProfile("default_4mb");
-
-    // Advertise NVS schema version (default is 1; increment if you restructure
-    // your own NVS namespaces and want server-side gating).
-    ota.setNvsSchemaVersion(1);
-
-    // Arbitrary labels for server-side deployment targeting.
-    // Must be a valid JSON object literal.
-    ota.setLabels("{\"site\":\"factory-A\",\"line\":\"3\"}");
-
-    // Advertise security capability to the server.
-    ota.setSecurityMode(SimpleOTAClient::SECURITY_MODE_BASIC);
-
-    // Human-readable version label of the firmware currently running.
-    // Shown on the dashboard under Reported firmware state → Version label.
-    // After the first OTA, the library persists the newly-installed version
-    // to NVS and reads it back automatically on subsequent boots, so this
-    // call is only strictly needed to populate the label before any OTA
-    // has occurred, or to override the NVS value.
-    ota.setVersionLabel(FIRMWARE_VERSION);
-
-    // Release channel, applied by the server on first registration or when
-    // the device has no channel yet. Subsequent check() calls still include
-    // this field, but the server only acts on it when the device is unassigned.
-    ota.setChannel("stable");
-
-    // Take manual control of the reboot.
-    ota.setAutoReboot(false);
-
-    if (ota.check()) {
-        Serial.printf("[app] update offered: version=%s\n", ota.lastOfferedVersion());
-        OTAResult r = ota.apply();   // setAutoReboot(false): success returns here
-        switch (r) {
-            case OTA_SUCCESS:
-                Serial.println("[app] flash succeeded; finishing app work before reboot");
-                // Application-specific shutdown: flush logs, persist state,
-                // notify a parent device, etc. Then reboot when ready.
-                delay(2000);
-                // rebootForUpdate() emits the "reboot" lifecycle event for
-                // the just-applied deployment, then calls esp_restart(). Use
-                // this instead of a bare ESP.restart() when running with
-                // setAutoReboot(false) so the server sees the same event
-                // sequence it would on the auto-reboot path.
-                ota.rebootForUpdate();
-                break;
-            case OTA_CHECKSUM_FAIL:
-                Serial.println("[app] checksum mismatch; safe to retry later");
-                break;
-            case OTA_FLASH_FAIL:
-                Serial.println("[app] flash failed; investigate partition table / network");
-                break;
-            case OTA_NO_OFFER:
-                // Unreachable here because we only reach apply() after a
-                // successful check(), but listed for completeness.
-                break;
-            case OTA_SIGNATURE_FAIL:
-                Serial.println("[app] signature rejected");
-                break;
-            case OTA_UNCONFIRMED:
-                // This firmware is still on trial: confirm it first.
-                Serial.println("[app] confirm the running firmware before updating");
-                break;
-            case OTA_REBOOT_PENDING:
-                // An earlier apply() flashed an update that waits for
-                // rebootForUpdate().
-                Serial.println("[app] update already flashed; reboot to install it");
-                break;
-        }
-    } else {
+    bool update = false;
+    esp_err_t err = simpleota_check(&update);
+    if (err != ESP_OK) {
+        // No response or an error status: back off, the server may be down.
+        Serial.printf("[app] check failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    if (!update) {
         Serial.println("[app] no update offered");
+        return;
+    }
+    Serial.printf("[app] update offered: version=%s\n", simpleota_last_offered_version());
+    switch (simpleota_apply()) {   // disable_auto_reboot: success returns here
+    case SIMPLEOTA_OK:
+        Serial.println("[app] flashed; finishing app work before the reboot");
+        // Flush logs, persist state, notify a parent device, and so on.
+        delay(2000);
+        // Posts the "reboot" event for this update, then restarts, so the
+        // server sees the same events as with an automatic reboot.
+        simpleota_reboot_for_update();
+        break;
+    case SIMPLEOTA_CHECKSUM_FAIL:
+        Serial.println("[app] checksum mismatch; safe to retry later");
+        break;
+    case SIMPLEOTA_FLASH_FAIL:
+        Serial.println("[app] update failed; see the reason in the event");
+        break;
+    case SIMPLEOTA_SIGNATURE_FAIL:
+        Serial.println("[app] signature rejected");
+        break;
+    case SIMPLEOTA_UNCONFIRMED:
+        Serial.println("[app] confirm the running firmware before updating");
+        break;
+    case SIMPLEOTA_DOWNGRADE:
+        Serial.println("[app] the offered build is not newer; refused");
+        break;
+    case SIMPLEOTA_REBOOT_PENDING:
+        Serial.println("[app] an update is already flashed; reboot to install it");
+        break;
+    case SIMPLEOTA_NO_OFFER:
+        break;   // not after a successful simpleota_check()
     }
 }
 
 void loop() {
-    // Application work goes here. This sketch performs a one-shot check
-    // in setup() and then returns to normal operation; schedule additional
-    // checks however suits your product (timer, button press, MQTT command).
+    // Application work goes here. This sketch checks once in setup(); check
+    // again however suits your product (a timer, a button, an MQTT command).
     delay(1000);
 }
